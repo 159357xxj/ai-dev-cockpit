@@ -51,6 +51,17 @@ npm run tauri build  # 发布构建（Phase 6 验证）
 
 版本以 `package-lock.json` / `src-tauri/Cargo.lock` 为准。主要依赖：React 19、react-router 8、recharts 3、Tailwind CSS 4、shadcn/ui（组件源码方式集成）、lucide-react、Tauri 2、serde、url。
 
+## 测试结果（2026-10-24 实测）
+
+| 套件 | 结果 |
+|---|---|
+| `cargo test`（src-tauri） | 47 通过 = 30 单元（DTO 契约/校验/聚合口径）+ 17 端到端（本地 mock 服务器，全离线）；公网验证 2 项默认 `#[ignore]` |
+| `npm run test`（Vitest） | 22 通过（页面导航/表单校验/演示模式开关/IPC snake_case 契约/真实模式事件流/聚合口径） |
+| `cargo fmt --check`、`cargo clippy -- -D warnings`、`npm run lint`、`npm run typecheck`、`npm run build` | 全部通过 |
+| 公网人工验证（已授权） | github.com 与 zcode.z.ai 各一次 DNS/TCP/HTTPS：全部成功，HTTPS 200 `ok_2xx`（3060ms / 414ms）——200 仅代表"收到响应"，不代表登录或业务可用 |
+
+自动化测试不依赖公网；真实网络探测仅由用户点击触发或显式运行 `--ignored` 用例。
+
 ## 文档索引
 
 - [PRD.md](PRD.md) — 产品需求
