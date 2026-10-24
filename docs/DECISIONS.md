@@ -55,6 +55,21 @@
 - 决定：界面文案简体中文；IPC 与数据库一律 RFC3339 UTC；仅展示层转本地时区。
 - 后果：跨时区数据可比；`format.ts` 统一时间格式化逻辑。
 
+## D-011 指标口径拆分：传输失败率 ≠ 非 2xx 响应比例（Phase 1 修订）
+- 背景：Phase 0 的 `ProbeAggregate` 只有一个 `success_count`（https 仅 2xx）及其派生的总失败率，隐含把"传输失败"（未收到 HTTP 响应）与"收到非 2xx 响应"混入同一口径。Phase 1 审核指出二者语义不同：前者反映链路问题（DNS/TCP/TLS/超时/代理），后者反映服务端给出的答案（401/403/429/5xx 等）。
+- 决定：`ProbeAggregate` 增加 `transport_failure_count` 与 `http_response_count` 两个计数；展示层必须同时给出**传输失败率**（分母 = 全部样本）与**非 2xx 响应比例**（分母 = 收到响应的样本），禁止合并展示；`request_failure_rate` 保留为 PRD 总览口径并标注定义。超时样本的耗时不得进入 min/median/max 分布。逐样本互斥恒等式：`attempts_total = success_count + transport_failure_count + non_2xx_count`。
+- 后果：ARCHITECTURE §5.4/§6.3 已同步修订；P4 规则引擎可基于更准确的证据分类；TEST_PLAN 增加对应聚合单测。本条修订 D-007 的落地细节，不推翻其结论。
+
+## D-012 探测后端依赖注入预留（Phase 1）
+- 背景：TEST_PLAN 要求自动化测试不依赖公网成功；需要本地 mock 注入点。同时正式构建不得因该方案获得任意 URL/端口探测能力。
+- 决定：`diagnostic/backend.rs` 定义 `trait ProbeBackend`，`AppState` 持有 `Arc<dyn ProbeBackend>`；生产构建在 `lib.rs::run()` 组装 `ProductionBackend`（目标只能来自 `targets.rs` 白名单注册表与用户表单合法参数）；`MockBackend`（本地 127.0.0.1 随机端口 mock 服务器）只在 `#[cfg(test)]` 与测试代码中构造；Tauri 命令签名与前端 IPC 面不暴露注入接口。
+- 后果：P2 起接入真实探测与 mock 测试无需改动业务分层；注入面收敛于组装点，攻击面不扩大。
+
+## D-013 Tauri 命令参数显式 `rename_all = "snake_case"`（D-003 的实现细化）
+- 背景：Tauri 2 命令宏默认按 **camelCase** 匹配 JS 侧 `invoke` 参数键，多单词参数（`job_id`、`run_id`、`manual_local_proxy_url`）会与本项目的 snake_case 线上契约错位。
+- 决定：所有 `#[tauri::command]` 显式标注 `rename_all = "snake_case"`；Rust 枚举配合 `#[serde(rename_all = "snake_case")]`（个别变体显式 `rename`）；TS 侧 `invoke` 一律传 snake_case 键。
+- 后果：宏属性存在性在 Phase 1 通过 tauri-macros 源码核查；端到端参数键行为由 Phase 2 契约测试实证（P1 无真实 IPC 数据流）。
+
 ---
 
 ## 技术风险登记表（Phase 0 版）

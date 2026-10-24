@@ -32,8 +32,10 @@
 ## 4. 各阶段测试清单
 
 ### Phase 1（脚手架与界面）
-- [ ] ≥3 个前端组件测试可运行（如：侧栏五页切换、诊断页表单校验提示、演示模式角标常驻）。
+- [ ] ≥3 个前端组件测试可运行（五页导航、诊断表单校验、Demo 标识开关行为）。
 - [ ] Rust 命令桩返回类型化 DTO（桩内静态值 + 明确"演示"标记，不假装联网）。
+- [ ] Rust 单测：请求校验（次数/超时/目标白名单/手动代理规则）、DTO serde snake_case round-trip、`ProbeAggregate` 指标拆分（传输失败 vs 非 2xx 响应，D-011）、目标注册表。
+- [ ] `ProbeBackend` 注入缝烟测：测试代码可替换 Mock 后端并获得不同结果（D-012）。
 - [ ] `npm run lint / typecheck / test` 真实通过；`cargo fmt --check / clippy -D warnings / test` 真实通过；`tauri dev` 真实启动。
 
 ### Phase 2（真实探测）
@@ -45,7 +47,7 @@
   - mock 延迟 > timeout_ms → `timeout`；
   - 取消（任务中途） → 剩余样本 `cancelled`，任务状态 `cancelled`，无伪造成功记录；
   - 非法参数（未知 target_id、repeats=4、timeout_ms=20000、manual 模式带 userinfo/非 loopback） → `invalid_input` 且任务不启动。
-- [ ] 采样聚合正确性：3/5 次的成功数、请求失败率、min/median/max（含偶数个样本的中位数定义）。
+- [ ] 采样聚合正确性：3/5 次的成功数、请求失败率、传输失败率与非 2xx 响应比例分口径统计（D-011）、min/median/max（含偶数个样本的中位数定义；超时样本不进入耗时分布）。
 - [ ] 并发上限 ≤3、全局截止 120s 有测试或明确人工验证记录。
 - [ ] 人工检查项：对 ≥2 个公网预设目标真实探测（截图/日志留档）；断网时可控失败。
 

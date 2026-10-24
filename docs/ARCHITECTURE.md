@@ -42,7 +42,9 @@ src-tauri/src/
     history.rs                # list_runs / get_run / delete_run / clear_history（P5）
     report.rs                 # preview_sanitized_report / export_sanitized_report（P5）
   diagnostic/
-    types.rs                  # 全部 DTO、枚举、错误分类（serde 双向）
+    types.rs                  # 全部 DTO、枚举、错误分类（serde 双向）+ 请求校验 + 聚合计算
+    targets.rs                # 预设目标白名单注册表（id → 域名/URL），探测目标唯一来源
+    backend.rs                # trait ProbeBackend + 生产/桩实现装配（依赖注入缝，见 2.1）
     scheduler.rs              # 任务编排：并发上限、每请求超时、全局截止、取消令牌
     dns.rs                    # 独立 DNS 查询测量（标准解析器）
     tcp.rs                    # 独立 TCP connect 测量
@@ -61,6 +63,11 @@ src-tauri/src/
 要点：
 - `diagnostic/` 与 `platform/windows/` 严格隔离：探测逻辑不 import 平台模块，平台模块不做网络请求。
 - `scheduler` 持有 `CancellationToken`（tokio_util），取消后剩余样本记为 `cancelled`，绝不补齐或伪造。
+
+### 2.1 探测后端依赖注入（Phase 1 预留，见 D-012）
+- `diagnostic/backend.rs` 定义 `trait ProbeBackend`（Phase 1 为最小形态，Phase 2 扩充为 dns/tcp/https 具体探测方法与调度入参）；`AppState` 持有 `Arc<dyn ProbeBackend + Send + Sync>`，命令层只经由该 trait 调用探测能力。
+- 生产构建在 `lib.rs::run()` 组装 `ProductionBackend`：其探测目标**只能来自 `targets.rs` 白名单注册表**与用户表单中的合法参数（次数/超时/loopback 代理），不存在"任意 URL/端口"入口。
+- `MockBackend`（指向本地 mock 服务器、绑定 127.0.0.1 随机端口）只在 `#[cfg(test)]` 与集成测试代码中构造；注入点收敛于 `lib.rs` 组装处与测试代码，**Tauri 命令签名与前端 IPC 面不暴露任何注入接口**——正式构建不会因该方案获得任意探测能力。
 
 ## 3. 前端模块设计
 
@@ -97,7 +104,8 @@ src/
 
 ### 5.1 通用约定
 - 传输：Tauri 2 `invoke` / `emit`，载荷为 JSON；**字段名统一 snake_case**（与 PRD 样例一致；Rust 结构体使用默认 serde 命名，TS 接口显式同名字段，不做运行时大小写转换）。
-- 命令返回统一为 `Result<T, IpcError>`；`IpcError { code: "invalid_input" | "not_found" | "internal" | "cancelled", message: string, detail?: string }`。
+- **命令参数命名（Phase 1 修订，见 D-013）**：Tauri 2 命令宏默认按 camelCase 匹配 JS 侧参数键，多单词参数（`job_id`/`run_id`）会与契约错位。因此**所有 `#[tauri::command]` 显式标注 `rename_all = "snake_case"`**，使 JS 侧 `invoke` 参数键与 DTO 字段同为 snake_case；Rust 枚举另加 `#[serde(rename_all = "snake_case")]`（个别变体用显式 `#[serde(rename)]`）保证字面量一致。宏属性的存在性在 Phase 1 以 tauri-macros 源码核查；端到端键名行为由 Phase 2 契约测试实证。
+- 命令返回统一为 `Result<T, IpcError>`；`IpcError { code: "invalid_input" | "not_found" | "not_available" | "internal" | "cancelled", message: string, detail?: string }`。`not_available` 为 Phase 1 新增：功能尚未实现或当前模式下不可用，前端据此展示"将在后续阶段提供"空态，而非错误假象。
 - 所有枚举以字符串序列化（如 `"no_app_proxy"`），前后端共用同一份枚举字面量。
 
 ### 5.2 命令清单
@@ -149,14 +157,22 @@ struct ProbeSample {
   tested_at: String,                  // RFC3339 UTC
 }
 
-// —— 每目标 × 每探测类型聚合 ——
+// —— 每目标 × 每探测类型聚合（Phase 1 修订：拆分"传输失败"与"非 2xx 响应"，见 D-011）——
 struct ProbeAggregate {
   probe_type: ProbeType,
   attempts_total: u32,
-  success_count: u32,
-  request_failure_rate: f64,          // (attempts_total - success_count) / attempts_total
-  duration_min_ms / duration_median_ms / duration_max_ms: Option<u64>, // 仅统计完成请求
+  success_count: u32,                 // https: 仅 2xx；dns/tcp: 成功
+  transport_failure_count: u32,       // 传输层失败：未收到任何 HTTP 响应（dns/tcp 未连通、TLS/超时/代理不可用/取消）
+  http_response_count: u32,           // 收到 HTTP 响应的样本数（任意状态码；仅 https 可能 >0）
+  request_failure_rate: f64,          // (attempts_total - success_count) / attempts_total —— PRD 口径的"请求失败率"
+  duration_min_ms / duration_median_ms / duration_max_ms: Option<u64>, // 仅统计完成请求；超时样本不进入耗时统计
 }
+// 逐样本互斥分类（恒等式）：
+//   attempts_total = success_count + transport_failure_count + non_2xx_count
+//   其中 non_2xx_count = http_response_count - success_count（仅 https 有意义；dns/tcp 恒为 0）
+// 派生比率由展示层计算，分母不同，禁止合并成一个口径：
+//   传输失败率     = transport_failure_count / attempts_total   （链路通不通）
+//   非 2xx 响应比例 = non_2xx_count / http_response_count        （服务端给出什么答案）
 
 struct DiagnosticRun {
   run_id: String,                     // UUID v4
@@ -210,6 +226,12 @@ struct ProxySnapshot { user_proxy: UserProxyInfo, env_vars: Vec<EnvVarInfo>, cap
 | `client_error_other_4xx` | 其他 4xx | 收到其他客户端错误响应 |
 
 禁止事项：不把 401/403/429/5xx 翻译成"服务正常/异常"的二元结论；不把 `tcp` 耗时称作 ICMP RTT；不把"请求失败率"称作"丢包率"。
+
+### 6.3 指标口径（Phase 1 冻结，见 D-011）
+- **传输失败率** = `transport_failure_count / attempts_total`：样本未到达 HTTP 响应层（DNS/TCP/TLS 失败、超时、代理不可用、取消）的比例，衡量"链路通不通"。
+- **非 2xx 响应比例** = `non_2xx_count / http_response_count`：在**收到响应**的样本中非 2xx 状态码的占比，衡量"服务端给出什么答案"。
+- 两者分母不同（`attempts_total` vs `http_response_count`），**禁止合并为一个"失败率"口径展示**。PRD 的 `request_failure_rate`（`(total-success)/total`）作为总览指标保留，但界面必须同时给出上述两个拆分口径。
+- 耗时统计（min/median/max）仅包含"完成"的请求；超时样本的耗时是"超时事实"，不得进入耗时分布。
 
 ## 7. 探测语义与路由模式（冻结）
 

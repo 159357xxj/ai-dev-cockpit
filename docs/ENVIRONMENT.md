@@ -39,3 +39,8 @@
 1. 本环境 Node 24 / Rust 1.97 较新：依赖版本一律以锁文件固定，升级需显式提交。
 2. WebView2 检测路径异常（注册表标准键缺失）说明：本机 EdgeUpdate 注册表布局与常见文档不同，Phase 6 打包 NSIS 时需复核 bootstrap 逻辑，不能以"注册表键存在"作为唯一判据。
 3. Windows SDK 位于 E 盘：若未来 CI 或其他机器构建失败，优先核对 `KitsRoot10` 注册表值与安装盘位。
+
+## 5. Phase 1 环境变更记录（2026-10-24）
+
+- `rustup component add rustfmt clippy`：工具链缺 rustfmt/clippy 组件（AGENTS.md 验证基线必需）。此操作为**用户级** rustup 组件安装（写入 `C:\Users\ASUS\.rustup`），无需管理员权限，不属于全局软件安装。安装后 `cargo fmt --check` 与 `cargo clippy -- -D warnings` 均可执行。
+- `tauri dev` 实测可启动桌面窗口（WebView2 渲染正常），无新增系统前置条件。
