@@ -70,6 +70,25 @@
 - 决定：所有 `#[tauri::command]` 显式标注 `rename_all = "snake_case"`；Rust 枚举配合 `#[serde(rename_all = "snake_case")]`（个别变体显式 `rename`）；TS 侧 `invoke` 一律传 snake_case 键。
 - 后果：宏属性存在性在 Phase 1 通过 tauri-macros 源码核查；端到端参数键行为由 Phase 2 契约测试实证（P1 无真实 IPC 数据流）。
 
+## D-014 取消样本口径：不入失败率分母；耗时仅成功样本（Phase 2，修订 D-011 落地细节）
+- 背景：Phase 2 引入真实取消后，"用户取消的样本"若计入传输失败会污染链路结论（用户主动中止 ≠ 网络故障）；同时实测发现失败样本（如拒连 ~0ms）若计入耗时分布会拉低最小值、扭曲统计。
+- 决定：`ProbeAggregate` 增加 `cancelled_count`；失败率分母为 `executed_total = attempts_total - cancelled_count`；取消前未开始的任务不产生样本，在途任务产生 `cancelled` 样本并保留展示；`duration_ms` 仅在 `success=true` 时有值。恒等式更新为 `attempts_total = success + transport_failure + non_2xx + cancelled`。
+- 后果：前端 metrics.ts 与 Rust types.rs 镜像测试同步修订；ARCHITECTURE §5.4/§6.3 已更新。不推翻 D-011 的拆分原则，仅细化其分母定义。
+
+## D-015 DNS 探测使用系统标准解析器（Phase 2）
+- 背景：PRD 要求"dns：本机 DNS 查询"；引入 hickory 等自研解析器会偏离系统真实行为并增加依赖。
+- 决定：`probe_dns` 使用 `tokio::net::lookup_host`（系统解析器），测得耗时为"系统解析器完成一次解析的总时长"，**不是原始 DNS 报文 RTT**；展示层如实标注。TCP 探测做一次不计时前置解析（失败归类 `dns_failure`），connect 只计建连耗时。
+- 后果：离线/缓存/hosts/DoH 等系统行为会影响读数——这是特性而非缺陷（反映系统真实解析路径）；测试限制：本机运营商解析器通配解析不存在域名（NXDOMAIN 重定向），DNS 失败分类无法离线稳定构造，记录为人工验证项。
+
+## D-016 HTTPS 实现细节：native-tls、错误链分类、重定向规则注入（Phase 2）
+- 背景：Reqwest 需要确定 TLS 后端与传输错误分类策略；重定向白名单规则在测试中需指向本地 mock。
+- 决定：
+  1. TLS 后端用 Reqwest 默认 native-tls（Windows SChannel，校验系统证书库），**永不绕过校验**；
+  2. 传输错误经 reqwest 错误链识别：`is_timeout` → 超时；connect 链含 "failed to lookup address information" → `dns_failure`；`ConnectionRefused` → `tcp_failure`；其余 connect 错误（TLS 握手失败为主）→ `tls_failure`；无法归因如实 `unknown`；
+  3. 重定向策略 `Policy::custom`：达上限或目标越界（非白名单主机/非 https/非 443）一律 `stop()`，保留可分类的 3xx 终态；
+  4. 重定向规则经 `RedirectRules` 注入（生产锁定白名单，测试指向 mock）；`JobSpec` 经 `ProductionBackend::with_spec_builder` 注入——**注入面只在 lib.rs 组装与测试代码，IPC 面不可达**（延续 D-012）。
+- 后果：E2E 测试实证 TLS 失败/拒连/越界重定向分类正确（Windows 实测）；`library_default` 的代理源语义仍留待 Phase 3 实测固化。
+
 ---
 
 ## 技术风险登记表（Phase 0 版）

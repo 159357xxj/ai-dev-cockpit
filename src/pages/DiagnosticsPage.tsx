@@ -17,7 +17,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
 import { useAppSettings } from '@/app/settings';
-import { api, normalizeIpcError } from '@/lib/api';
+import { normalizeIpcError, runDiagnostic, api, type DiagnosticRunSession } from '@/lib/api';
 import { fmtDurationMs, fmtPercent } from '@/lib/format';
 import { aggregateSamples, non2xxResponseRatio, transportFailureRate } from '@/lib/metrics';
 import {
@@ -30,7 +30,13 @@ import {
   TIMEOUT_MAX_MS,
   TIMEOUT_MIN_MS,
 } from '@/lib/types';
-import type { DiagnosticRequest, IpcError, ProbeSample, RouteMode, RunStatus } from '@/lib/types';
+import type {
+  DiagnosticRequest,
+  IpcError,
+  ProbeSample,
+  ProbeType,
+  RouteMode,
+} from '@/lib/types';
 import { cn } from '@/lib/utils';
 import { buildDemoTargets } from '@/features/demo/mockData';
 
@@ -102,6 +108,12 @@ function validateForm(form: FormState): FormErrors {
   return errors;
 }
 
+const PROBE_TYPE_LABELS: Record<ProbeType, string> = {
+  dns: 'DNS',
+  tcp: 'TCP',
+  https: 'HTTPS',
+};
+
 function sampleResultLabel(sample: ProbeSample): string {
   if (sample.error) return ERROR_KIND_LABELS[sample.error.kind];
   if (sample.http_status !== null) {
@@ -110,10 +122,24 @@ function sampleResultLabel(sample: ProbeSample): string {
   return sample.success ? '成功' : '失败';
 }
 
-type RunState = 'idle' | RunStatus;
+type RunState = 'idle' | 'running' | 'completed' | 'cancelled' | 'failed';
+
+/** 按 (target_id, probe_type, attempt_no) 去重合并样本（事件乱序/重复安全）。 */
+function upsertSample(samples: ProbeSample[], incoming: ProbeSample): ProbeSample[] {
+  const key = (sample: ProbeSample): string =>
+    `${sample.target_id}|${sample.probe_type}|${sample.attempt_no}`;
+  const filtered = samples.filter((sample) => key(sample) !== key(incoming));
+  return [...filtered, incoming].sort(
+    (a, b) =>
+      a.target_id.localeCompare(b.target_id) ||
+      a.probe_type.localeCompare(b.probe_type) ||
+      a.attempt_no - b.attempt_no,
+  );
+}
 
 export function DiagnosticsPage() {
   const { settings } = useAppSettings();
+  const demoMode = settings.demoMode;
   const [form, setForm] = useState<FormState>({
     targetIds: [],
     routeMode: 'no_app_proxy',
@@ -123,22 +149,24 @@ export function DiagnosticsPage() {
   });
   const [errors, setErrors] = useState<FormErrors>({});
   const [runState, setRunState] = useState<RunState>('idle');
-  const [revealedSamples, setRevealedSamples] = useState<ProbeSample[]>([]);
-  const [plannedTargets, setPlannedTargets] = useState<string[]>([]);
+  const [percent, setPercent] = useState(0);
+  const [resultSamples, setResultSamples] = useState<ProbeSample[]>([]);
   const [ipcError, setIpcError] = useState<IpcError | null>(null);
-  const timerRef = useRef<number | null>(null);
+  const demoTimerRef = useRef<number | null>(null);
+  const sessionRef = useRef<DiagnosticRunSession | null>(null);
 
   useEffect(
     () => () => {
-      if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+      if (demoTimerRef.current !== null) window.clearTimeout(demoTimerRef.current);
+      sessionRef.current?.unsubscribe();
     },
     [],
   );
 
-  const stopTimer = (): void => {
-    if (timerRef.current !== null) {
-      window.clearTimeout(timerRef.current);
-      timerRef.current = null;
+  const stopDemoTimer = (): void => {
+    if (demoTimerRef.current !== null) {
+      window.clearTimeout(demoTimerRef.current);
+      demoTimerRef.current = null;
     }
   };
 
@@ -151,46 +179,71 @@ export function DiagnosticsPage() {
     }));
   };
 
+  // —— 演示模式：纯前端模拟，与真实路径完全隔离 ——
+
   const startDemoRun = (): void => {
     const plan = buildDemoTargets(form.targetIds, form.repeats, form.routeMode);
     const flat = plan.flatMap((target) => target.samples);
-    setPlannedTargets(plan.map((target) => target.target_id));
-    setRevealedSamples([]);
+    setResultSamples([]);
     setIpcError(null);
+    setPercent(0);
     setRunState('running');
     let index = 0;
     const tick = (): void => {
       index += 1;
-      setRevealedSamples(flat.slice(0, index));
+      setResultSamples(flat.slice(0, index));
+      setPercent(Math.round((index / flat.length) * 100));
       if (index >= flat.length) {
         setRunState('completed');
-        timerRef.current = null;
+        demoTimerRef.current = null;
       } else {
-        timerRef.current = window.setTimeout(tick, 450);
+        demoTimerRef.current = window.setTimeout(tick, 450);
       }
     };
-    timerRef.current = window.setTimeout(tick, 450);
+    demoTimerRef.current = window.setTimeout(tick, 450);
   };
+
+  // —— 真实模式：事件订阅先于启动（api.ts 内保证），样本只来自事件与终态 run ——
 
   const startRealRun = async (): Promise<void> => {
     setIpcError(null);
+    setResultSamples([]);
+    setPercent(0);
     setRunState('running');
     const request: DiagnosticRequest = {
       target_ids: form.targetIds,
       route_mode: form.routeMode,
-      manual_local_proxy_url:
-        form.routeMode === 'manual_local_proxy' ? form.proxyUrl.trim() : null,
+      manual_local_proxy_url: null,
       repeats: form.repeats,
       timeout_ms: Number(form.timeoutMs),
     };
     try {
-      const handle = await api.startDiagnostic(request);
-      // Phase 2：订阅 diagnostic://progress 事件推进状态；当前不会到达此处。
-      setRunState('completed');
-      console.info('诊断任务已创建', handle.job_id);
+      const session = await runDiagnostic(request, {
+        onProgress: (payload) => {
+          setPercent(payload.percent);
+          if (payload.sample) {
+            setResultSamples((previous) => upsertSample(previous, payload.sample as ProbeSample));
+          }
+        },
+        onCompleted: ({ run }) => {
+          sessionRef.current?.unsubscribe();
+          sessionRef.current = null;
+          // 终态 run 是权威结果：整体替换，避免事件乱序残留。
+          setResultSamples(run.targets.flatMap((target) => target.samples));
+          setRunState(
+            run.status === 'cancelled' ? 'cancelled' : 'completed',
+          );
+        },
+        onFailed: ({ error }) => {
+          sessionRef.current?.unsubscribe();
+          sessionRef.current = null;
+          setIpcError(error);
+          setRunState('failed');
+        },
+      });
+      sessionRef.current = session;
     } catch (raw) {
-      const error = normalizeIpcError(raw);
-      setIpcError(error);
+      setIpcError(normalizeIpcError(raw));
       setRunState('failed');
     }
   };
@@ -199,16 +252,25 @@ export function DiagnosticsPage() {
     const found = validateForm(form);
     setErrors(found);
     if (Object.keys(found).length > 0) return;
-    if (settings.demoMode) {
+    if (demoMode) {
       startDemoRun();
     } else {
       void startRealRun();
     }
   };
 
-  const onCancel = (): void => {
-    stopTimer();
-    setRunState('cancelled');
+  const onCancel = async (): Promise<void> => {
+    if (demoMode) {
+      stopDemoTimer();
+      setRunState('cancelled');
+      return;
+    }
+    // 真实模式：交给后端取消令牌；终态由 completed 事件（run.status=cancelled）驱动。
+    try {
+      await api.cancelDiagnostic(sessionRef.current?.jobId ?? '');
+    } catch (raw) {
+      setIpcError(normalizeIpcError(raw));
+    }
   };
 
   const running = runState === 'running';
@@ -217,11 +279,11 @@ export function DiagnosticsPage() {
     <div>
       <PageHeader
         title="服务诊断"
-        description="选择目标与连接模式，对预设服务执行独立探测"
-        actions={settings.demoMode ? <DemoBadge /> : null}
+        description="选择目标与连接模式，对预设服务执行独立探测（DNS / TCP / HTTPS 相互独立）"
+        actions={demoMode ? <DemoBadge /> : null}
       />
 
-      {settings.demoMode ? <DemoBanner /> : null}
+      {demoMode ? <DemoBanner /> : null}
 
       <div className="grid gap-4 lg:grid-cols-[380px_minmax(0,1fr)]">
         <Card>
@@ -273,11 +335,21 @@ export function DiagnosticsPage() {
                 }
               >
                 {(Object.keys(ROUTE_MODE_LABELS) as RouteMode[]).map((mode) => (
-                  <option key={mode} value={mode}>
+                  <option
+                    key={mode}
+                    value={mode}
+                    disabled={!demoMode && mode !== 'no_app_proxy'}
+                  >
                     {ROUTE_MODE_LABELS[mode]}
+                    {!demoMode && mode !== 'no_app_proxy' ? ' — Phase 3 提供' : ''}
                   </option>
                 ))}
               </Select>
+              {!demoMode ? (
+                <p className="text-xs text-muted-foreground">
+                  当前阶段仅支持 no_app_proxy（不配置应用层代理；系统 TUN/透明路由仍可能生效）。
+                </p>
+              ) : null}
             </div>
 
             {form.routeMode === 'manual_local_proxy' ? (
@@ -304,7 +376,7 @@ export function DiagnosticsPage() {
 
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
-                <Label htmlFor="repeats">采样次数</Label>
+                <Label htmlFor="repeats">采样次数（HTTPS）</Label>
                 <Select
                   id="repeats"
                   value={String(form.repeats)}
@@ -341,21 +413,10 @@ export function DiagnosticsPage() {
               <Button onClick={onStart} disabled={running} className="flex-1">
                 <Play aria-hidden /> 开始诊断
               </Button>
-              <Button onClick={onCancel} disabled={!running} variant="outline">
+              <Button onClick={() => void onCancel()} disabled={!running} variant="outline">
                 <Square aria-hidden /> 取消
               </Button>
             </div>
-
-            {form.routeMode === 'no_app_proxy' ? (
-              <p className="text-xs text-muted-foreground">
-                说明：无应用代理仅指不配置应用层 HTTP 代理；系统 TUN/透明路由仍可能生效。
-              </p>
-            ) : null}
-            {form.routeMode === 'manual_local_proxy' ? (
-              <p className="text-xs text-muted-foreground">
-                说明：socks5 由本机解析域名，socks5h 由代理解析域名；代理不可用时明确失败，绝不回落。
-              </p>
-            ) : null}
           </CardContent>
         </Card>
 
@@ -367,91 +428,104 @@ export function DiagnosticsPage() {
               icon={Inbox}
               title="尚未开始诊断"
               description={
-                settings.demoMode
+                demoMode
                   ? '演示模式：点击「开始诊断」查看模拟流程与数据形态。'
-                  : '真实 DNS/TCP/HTTPS 探测将在 Phase 2 提供；本阶段仅界面骨架。'
+                  : '开始后将依次执行 DNS、TCP、HTTPS 三类独立探测，可随时取消。'
               }
             />
           ) : null}
 
-          {revealedSamples.length > 0 ? (
+          {running ? (
+            <Alert variant="info">
+              <AlertDescription>
+                探测进行中…（{percent}%）。DNS/TCP 为独立基线，HTTPS 按模式采样；可点击「取消」中止。
+              </AlertDescription>
+            </Alert>
+          ) : null}
+
+          {resultSamples.length > 0 ? (
             <Card>
               <CardHeader>
                 <div className="flex items-center justify-between">
                   <CardTitle className="text-base">
                     诊断结果
-                    {settings.demoMode ? '（模拟）' : ''}
+                    {demoMode ? '（模拟）' : ''}
                   </CardTitle>
                   <div className="flex items-center gap-2">
-                    {runState === 'running' ? (
-                      <span className="text-xs text-muted-foreground">进行中…</span>
-                    ) : null}
                     {runState === 'completed' ? (
                       <span className="text-xs text-muted-foreground">已完成</span>
                     ) : null}
                     {runState === 'cancelled' ? (
-                      <span className="text-xs text-amber-500">已取消</span>
+                      <span className="text-xs text-amber-500">已取消（已完成样本保留）</span>
                     ) : null}
-                    {settings.demoMode ? <DemoBadge /> : null}
+                    {demoMode ? <DemoBadge /> : null}
                   </div>
                 </div>
               </CardHeader>
               <CardContent className="space-y-4">
-                {plannedTargets.map((targetId) => {
-                  const samples = revealedSamples.filter((sample) => sample.target_id === targetId);
-                  if (samples.length === 0) return null;
-                  const aggregate = aggregateSamples('https', samples);
-                  return (
-                    <div key={targetId} className="space-y-2">
-                      <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
-                        <span>{targetId}</span>
-                        <span className="rounded bg-secondary px-1.5 py-0.5 text-xs text-secondary-foreground">
-                          样本 {aggregate.attempts_total}
-                        </span>
-                        <span className="rounded bg-secondary px-1.5 py-0.5 text-xs text-secondary-foreground">
-                          成功 {aggregate.success_count}
-                        </span>
-                        <span className="rounded bg-secondary px-1.5 py-0.5 text-xs text-secondary-foreground">
-                          传输失败 {aggregate.transport_failure_count}
-                          {`（${fmtPercent(transportFailureRate(aggregate))}）`}
-                        </span>
-                        <span className="rounded bg-secondary px-1.5 py-0.5 text-xs text-secondary-foreground">
-                          非2xx {fmtPercent(non2xxResponseRatio(aggregate))}
-                        </span>
-                        <span className="rounded bg-secondary px-1.5 py-0.5 text-xs text-secondary-foreground">
-                          min {fmtDurationMs(aggregate.duration_min_ms)} / med{' '}
-                          {fmtDurationMs(aggregate.duration_median_ms)} / max{' '}
-                          {fmtDurationMs(aggregate.duration_max_ms)}
-                        </span>
-                      </div>
-                      <div className="overflow-x-auto rounded-md border border-border">
-                        <table className="w-full text-sm">
-                          <thead className="bg-muted/50 text-left text-xs text-muted-foreground">
-                            <tr>
-                              <th className="px-3 py-2 font-medium">#</th>
-                              <th className="px-3 py-2 font-medium">探测</th>
-                              <th className="px-3 py-2 font-medium">结果</th>
-                              <th className="px-3 py-2 font-medium">HTTP 状态</th>
-                              <th className="px-3 py-2 font-medium">耗时</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {samples.map((sample) => (
-                              <tr key={`${sample.target_id}-${sample.attempt_no}`} className="border-t border-border">
-                                <td className="px-3 py-1.5">{sample.attempt_no}</td>
-                                <td className="px-3 py-1.5">HTTPS</td>
-                                <td className="px-3 py-1.5">{sampleResultLabel(sample)}</td>
-                                <td className="px-3 py-1.5">{sample.http_status ?? '—'}</td>
-                                <td className="px-3 py-1.5">{fmtDurationMs(sample.duration_ms)}</td>
+                {Array.from(new Set(resultSamples.map((sample) => sample.target_id))).map(
+                  (targetId) => {
+                    const targetSamples = resultSamples.filter(
+                      (sample) => sample.target_id === targetId,
+                    );
+                    const probeTypes = Array.from(
+                      new Set(targetSamples.map((sample) => sample.probe_type)),
+                    );
+                    return (
+                      <div key={targetId} className="space-y-2">
+                        <div className="flex flex-wrap items-center gap-2 text-sm font-medium">
+                          <span>{targetId}</span>
+                          {probeTypes.map((probeType) => {
+                            const aggregate = aggregateSamples(
+                              probeType,
+                              targetSamples.filter((sample) => sample.probe_type === probeType),
+                            );
+                            const rate = transportFailureRate(aggregate);
+                            return (
+                              <span
+                                key={probeType}
+                                className="rounded bg-secondary px-1.5 py-0.5 text-xs text-secondary-foreground"
+                              >
+                                {PROBE_TYPE_LABELS[probeType]}：{aggregate.success_count}/
+                                {aggregate.attempts_total} 成功 · 传输失败 {rate === null ? '—' : fmtPercent(rate)} ·
+                                非2xx {fmtPercent(non2xxResponseRatio(aggregate))} · med{' '}
+                                {fmtDurationMs(aggregate.duration_median_ms)}
+                              </span>
+                            );
+                          })}
+                        </div>
+                        <div className="overflow-x-auto rounded-md border border-border">
+                          <table className="w-full text-sm">
+                            <thead className="bg-muted/50 text-left text-xs text-muted-foreground">
+                              <tr>
+                                <th className="px-3 py-2 font-medium">探测</th>
+                                <th className="px-3 py-2 font-medium">#</th>
+                                <th className="px-3 py-2 font-medium">结果</th>
+                                <th className="px-3 py-2 font-medium">HTTP 状态</th>
+                                <th className="px-3 py-2 font-medium">耗时</th>
                               </tr>
-                            ))}
-                          </tbody>
-                        </table>
+                            </thead>
+                            <tbody>
+                              {targetSamples.map((sample) => (
+                                <tr
+                                  key={`${sample.probe_type}-${sample.attempt_no}`}
+                                  className="border-t border-border"
+                                >
+                                  <td className="px-3 py-1.5">{PROBE_TYPE_LABELS[sample.probe_type]}</td>
+                                  <td className="px-3 py-1.5">{sample.attempt_no}</td>
+                                  <td className="px-3 py-1.5">{sampleResultLabel(sample)}</td>
+                                  <td className="px-3 py-1.5">{sample.http_status ?? '—'}</td>
+                                  <td className="px-3 py-1.5">{fmtDurationMs(sample.duration_ms)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
                       </div>
-                    </div>
-                  );
-                })}
-                {settings.demoMode ? (
+                    );
+                  },
+                )}
+                {demoMode ? (
                   <Alert variant="warning">
                     <AlertDescription>
                       以上样本与统计全部为模拟数据（D-009），不代表真实网络测量。

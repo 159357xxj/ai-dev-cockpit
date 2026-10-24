@@ -38,18 +38,25 @@
 - [ ] `ProbeBackend` 注入缝烟测：测试代码可替换 Mock 后端并获得不同结果（D-012）。
 - [ ] `npm run lint / typecheck / test` 真实通过；`cargo fmt --check / clippy -D warnings / test` 真实通过；`tauri dev` 真实启动。
 
-### Phase 2（真实探测）
-- [ ] L2 用例矩阵：
-  - 200 → `success=true, http_outcome=ok_2xx`；
-  - 401/403 → `success=false, http_outcome=auth_required_401_403`，error 为空（收到响应≠错误）；
-  - 407 / 429 / 500 / 301(达上限) → 对应 outcome，均不标绿；
-  - 立即断连 → 分类为 `tcp_failure` 或 `tls_failure`（按阶段），不得误判为 `unknown`；
-  - mock 延迟 > timeout_ms → `timeout`；
-  - 取消（任务中途） → 剩余样本 `cancelled`，任务状态 `cancelled`，无伪造成功记录；
-  - 非法参数（未知 target_id、repeats=4、timeout_ms=20000、manual 模式带 userinfo/非 loopback） → `invalid_input` 且任务不启动。
-- [ ] 采样聚合正确性：3/5 次的成功数、请求失败率、传输失败率与非 2xx 响应比例分口径统计（D-011）、min/median/max（含偶数个样本的中位数定义；超时样本不进入耗时分布）。
-- [ ] 并发上限 ≤3、全局截止 120s 有测试或明确人工验证记录。
-- [ ] 人工检查项：对 ≥2 个公网预设目标真实探测（截图/日志留档）；断网时可控失败。
+### Phase 2（真实探测）—— 已实现（Phase 2 交付）
+- [x] L2 用例矩阵（`tests/probes_e2e.rs`，本地 mock 服务器，全部离线）：
+  - 200 → `ok_2xx`；401/403 → `auth_required_401_403` 且 error 为空（收到响应≠错误）；
+  - 301/302 → 策略内跟随；302→401 按终态分类；407/429/500 → 对应 outcome 均不标绿；
+  - 405 → 一次 GET 回退（/method-check 实证）；读体上限 64KiB（慢滴流 2MB + 服务端写失败标记实证）；
+  - 重定向自循环/越界（非白名单域名）→ 保留可分类 3xx；拒连 → `tcp_failure`；
+  - https 访问纯 HTTP 端口 → `tls_failure`；mock 延迟 > timeout → `timeout`；
+  - 任务取消（在途样本 `cancelled`、未执行目标零样本）、重复取消幂等、任务截止、
+    并发上限（5 请求实测 max_active=3）、聚合-样本一致性（含 D-014 取消恒等式）。
+- [x] 采样聚合正确性：3/5 次的成功数、请求失败率、传输失败率与非 2xx 响应比例分口径统计（D-011/D-014）、min/median/max（偶数中位数；耗时仅成功样本）。
+- [x] 并发上限 ≤3、任务截止（常量 120s，测试以注入短截止验证同一逻辑路径）。
+- [x] IPC snake_case 契约：前端 Vitest 断言 invoke 命令名/参数键 + 订阅先于启动 + 缓冲回放；Rust 侧命令实现函数单测。
+  **限制**：完整 Tauri webview IPC 往返（宏参数名匹配）无法在 cargo test 内自动化，由 `tauri dev` 人工联调覆盖。
+  **限制**：DNS 失败分类无法离线稳定构造（本机运营商解析器通配解析不存在域名），`dns_failure` 的 reqwest 错误链识别逻辑记录为人工验证项。
+- [x] 人工检查项（用户已授权联网，2026-10-24 实测记录，`cargo test --test probes_public -- --ignored --nocapture`）：
+  - **github.com**：DNS 成功（7ms）→ TCP 443 成功 → HTTPS 200 `ok_2xx`（3060ms）；
+  - **zcode.z.ai**：DNS 成功（7ms）→ TCP 443 成功 → HTTPS 200 `ok_2xx`（414ms）。
+  - 说明：HTTP 200 仅证明"收到响应"（D-007），不宣称登录/业务可用；实测命令与输出见 Phase 2 报告。
+  - 断网场景与桌面应用内真实探测留待用户日常使用中观察（分类逻辑已由离线 E2E 覆盖）。
 
 ### Phase 3（代理与对比）
 - [ ] 代理 URL 校验表驱动用例：合法 http/socks5/socks5h loopback；非法（userinfo、非 loopback host、无端口、path/query、错误 scheme）。

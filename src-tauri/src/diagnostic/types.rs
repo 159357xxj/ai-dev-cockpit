@@ -204,7 +204,8 @@ pub struct ProbeSample {
     pub attempt_no: u32,
     /// https：仅 2xx 为 true；dns/tcp：连通/解析成功即 true。
     pub success: bool,
-    /// None = 测量未完成（超时/取消/任务失败）；超时样本不得进入耗时分布。
+    /// 耗时仅在 `success=true` 时有值；失败/超时/取消一律 None——
+    /// 耗时分布因此是"成功请求的耗时分布"，失败瞬时返回不会拉低最小值。
     pub duration_ms: Option<u64>,
     pub http_status: Option<u16>,
     pub http_outcome: Option<HttpOutcome>,
@@ -214,17 +215,48 @@ pub struct ProbeSample {
     pub tested_at: String,
 }
 
-/// 每目标 × 每探测类型的聚合（Phase 1 修订口径，D-011）。
+impl ProbeSample {
+    /// 已取消样本：未产生网络结论，`duration` 恒为 None（D-014：不进入失败率分母）。
+    pub fn cancelled(
+        target_id: &str,
+        probe_type: ProbeType,
+        route_mode: RouteMode,
+        attempt_no: u32,
+    ) -> Self {
+        Self {
+            target_id: target_id.to_string(),
+            probe_type,
+            route_mode,
+            attempt_no,
+            success: false,
+            duration_ms: None,
+            http_status: None,
+            http_outcome: None,
+            error: Some(DiagnosticError {
+                kind: ErrorKind::Cancelled,
+                summary: "任务已取消，本次样本未产生结论".to_string(),
+                detail: None,
+            }),
+            tested_at: now_rfc3339(),
+        }
+    }
+}
+
+/// 每目标 × 每探测类型的聚合（D-011 口径 + D-014 取消口径）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeAggregate {
     pub probe_type: ProbeType,
+    /// 全部样本数（含已取消）。
     pub attempts_total: u32,
+    /// 用户取消 / 任务截止未完成的样本：单独计数，不进入任何失败率的分母（D-014）。
+    pub cancelled_count: u32,
+    /// 执行完成且成功（https 仅 2xx；dns/tcp 连通/解析成功）。
     pub success_count: u32,
-    /// 传输层失败：未收到任何 HTTP 响应。
+    /// 传输层失败：执行完成但未收到任何 HTTP 响应（不含已取消样本）。
     pub transport_failure_count: u32,
     /// 收到 HTTP 响应的样本数（任意状态码；仅 https 可能大于 0）。
     pub http_response_count: u32,
-    /// (attempts_total - success_count) / attempts_total，PRD 总览口径。
+    /// (executed_total - success_count) / executed_total，PRD 总览口径；分母不含已取消样本。
     pub request_failure_rate: f64,
     pub duration_min_ms: Option<u64>,
     pub duration_median_ms: Option<u64>,
@@ -232,15 +264,22 @@ pub struct ProbeAggregate {
 }
 
 impl ProbeAggregate {
-    /// 将同一 (target_id, probe_type) 的样本聚合。逐样本互斥分类（D-011）：
-    /// - 有 `error` → 传输失败（未收到 HTTP 响应）；
+    /// 将同一 (target_id, probe_type) 的样本聚合。
+    ///
+    /// 逐样本互斥分类（D-011 + D-014）：
+    /// - `error.kind == cancelled` → 已取消（独立计数）；
+    /// - 其他 `error` → 传输失败（未收到 HTTP 响应）；
     /// - 有 `http_status` → 收到响应（`success` 仅当 2xx）；
     /// - 其余（dns/tcp 成功）→ 成功；
     /// - 防御分支（无 error、无响应又标记失败）→ 归入传输失败。
     ///
+    /// 恒等式：`attempts_total = success_count + transport_failure_count
+    ///          + non_2xx_count + cancelled_count`（non_2xx = http_response_count - success_count）。
+    ///
     /// 耗时分布只包含 `duration_ms` 非空的样本；超时/取消样本不进入。
     pub fn from_samples(probe_type: ProbeType, samples: &[ProbeSample]) -> Self {
         let attempts_total = samples.len() as u32;
+        let mut cancelled_count = 0u32;
         let mut success_count = 0u32;
         let mut transport_failure_count = 0u32;
         let mut http_response_count = 0u32;
@@ -250,7 +289,13 @@ impl ProbeAggregate {
             if let Some(duration) = sample.duration_ms {
                 durations.push(duration);
             }
-            if sample.error.is_some() {
+            if sample
+                .error
+                .as_ref()
+                .is_some_and(|error| error.kind == ErrorKind::Cancelled)
+            {
+                cancelled_count += 1;
+            } else if sample.error.is_some() {
                 transport_failure_count += 1;
             } else if sample.http_status.is_some() {
                 http_response_count += 1;
@@ -280,15 +325,17 @@ impl ProbeAggregate {
             ),
         };
 
-        let request_failure_rate = if attempts_total == 0 {
+        let executed_total = attempts_total - cancelled_count;
+        let request_failure_rate = if executed_total == 0 {
             0.0
         } else {
-            f64::from(attempts_total - success_count) / f64::from(attempts_total)
+            f64::from(executed_total - success_count) / f64::from(executed_total)
         };
 
         Self {
             probe_type,
             attempts_total,
+            cancelled_count,
             success_count,
             transport_failure_count,
             http_response_count,
@@ -299,12 +346,19 @@ impl ProbeAggregate {
         }
     }
 
-    /// 传输失败率 = transport_failure_count / attempts_total（D-011）。
-    pub fn transport_failure_rate(&self) -> f64 {
-        if self.attempts_total == 0 {
-            0.0
+    /// 实际执行（未取消）的样本数；失败率口径的分母。
+    pub fn executed_total(&self) -> u32 {
+        self.attempts_total - self.cancelled_count
+    }
+
+    /// 传输失败率 = transport_failure_count / executed_total（D-014：取消样本不入分母）。
+    /// 全部样本被取消时返回 None（口径不适用）。
+    pub fn transport_failure_rate(&self) -> Option<f64> {
+        let executed = self.executed_total();
+        if executed == 0 {
+            None
         } else {
-            f64::from(self.transport_failure_count) / f64::from(self.attempts_total)
+            Some(f64::from(self.transport_failure_count) / f64::from(executed))
         }
     }
 
@@ -339,6 +393,56 @@ pub struct DiagnosticRun {
     pub repeats: u8,
     pub app_version: String,
     pub targets: Vec<TargetResult>,
+}
+
+/// 进度事件状态：任务开始 / 单个样本完成。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressStatus {
+    Running,
+    SampleFinished,
+}
+
+/// `diagnostic://progress` 事件载荷。样本完成时携带该样本本体，
+/// 前端无需轮询即可实时呈现（终态以 completed/failed 事件为准）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressPayload {
+    pub job_id: String,
+    /// 0..=100，按"已完成样本数 / 计划样本数"计算。
+    pub percent: u8,
+    pub status: ProgressStatus,
+    pub message: Option<String>,
+    pub sample: Option<ProbeSample>,
+}
+
+/// `diagnostic://completed` 事件载荷：终态运行结果（含已取消状态）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletedPayload {
+    pub job_id: String,
+    pub run: DiagnosticRun,
+}
+
+/// `diagnostic://failed` 事件载荷：任务级失败（未产生可归因样本的内部错误）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedPayload {
+    pub job_id: String,
+    pub error: IpcError,
+}
+
+/// 任务事件。`Completed` 是包含已取消在内的正常终态（run.status 区分）；
+/// `Failed` 是任务级失败。终态事件的"恰好一个"保证由
+/// `scheduler::TerminalGuard` 实现：正常完成发 Completed，异常终止（含 panic）
+/// 经 Drop 兜底发 Failed，二者互斥且必居其一。
+#[derive(Debug, Clone)]
+pub enum JobEvent {
+    Progress(ProgressPayload),
+    Completed(CompletedPayload),
+    Failed(FailedPayload),
+}
+
+/// 当前 UTC 时间的 RFC3339 字符串（毫秒精度，Z 后缀）。
+pub fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// `start_diagnostic` 的返回句柄；Phase 2 起用于进度事件与取消。
@@ -585,7 +689,7 @@ mod tests {
         let samples = vec![
             http_sample(1, Some(200), true, Some(100)),
             http_sample(2, Some(200), true, Some(200)),
-            http_sample(3, Some(401), false, Some(300)),
+            http_sample(3, Some(401), false, None),
             transport_sample(4, ErrorKind::TcpFailure, None),
             transport_sample(5, ErrorKind::Timeout, None),
         ];
@@ -596,15 +700,15 @@ mod tests {
         assert_eq!(aggregate.http_response_count, 3, "401 也是收到响应");
         assert_eq!(aggregate.transport_failure_count, 2);
         assert!((aggregate.request_failure_rate - 0.6).abs() < 1e-9);
-        assert!((aggregate.transport_failure_rate() - 0.4).abs() < 1e-9);
+        assert!((aggregate.transport_failure_rate().unwrap() - 0.4).abs() < 1e-9);
         // 非 2xx 比例 = (3-2)/3，分母是收到响应的样本（D-011）。
         let ratio = aggregate.non_2xx_response_ratio().expect("https 有响应");
         assert!((ratio - 1.0 / 3.0).abs() < 1e-9);
 
-        // 超时样本无 duration，不进入耗时分布。
+        // 耗时分布只含成功样本（401/失败/超时均为 None）。
         assert_eq!(aggregate.duration_min_ms, Some(100));
-        assert_eq!(aggregate.duration_median_ms, Some(200));
-        assert_eq!(aggregate.duration_max_ms, Some(300));
+        assert_eq!(aggregate.duration_median_ms, Some(150));
+        assert_eq!(aggregate.duration_max_ms, Some(200));
     }
 
     #[test]
@@ -642,6 +746,69 @@ mod tests {
         assert_eq!(aggregate.http_response_count, 0);
         assert_eq!(aggregate.transport_failure_count, 1);
         assert!(aggregate.non_2xx_response_ratio().is_none());
+    }
+
+    #[test]
+    fn aggregate_excludes_cancelled_from_failure_rates() {
+        // D-014：取消样本单独计数，不进入失败率分母。
+        // 4 个 https 样本：1×200 成功、1×TCP 失败、2×用户取消。
+        let samples = vec![
+            http_sample(1, Some(200), true, Some(100)),
+            transport_sample(2, ErrorKind::TcpFailure, None),
+            transport_sample(3, ErrorKind::Cancelled, None),
+            transport_sample(4, ErrorKind::Cancelled, None),
+        ];
+        let aggregate = ProbeAggregate::from_samples(ProbeType::Https, &samples);
+
+        assert_eq!(aggregate.attempts_total, 4);
+        assert_eq!(aggregate.cancelled_count, 2);
+        assert_eq!(aggregate.executed_total(), 2);
+        assert_eq!(aggregate.transport_failure_count, 1);
+        assert!((aggregate.transport_failure_rate().unwrap() - 0.5).abs() < 1e-9);
+        assert!((aggregate.request_failure_rate - 0.5).abs() < 1e-9);
+        // 恒等式：4 = 1 成功 + 1 传输失败 + 0 非2xx + 2 取消。
+        let non_2xx = aggregate.http_response_count - aggregate.success_count;
+        assert_eq!(
+            aggregate.success_count
+                + aggregate.transport_failure_count
+                + non_2xx
+                + aggregate.cancelled_count,
+            aggregate.attempts_total
+        );
+    }
+
+    #[test]
+    fn aggregate_handles_all_cancelled() {
+        let samples = vec![
+            transport_sample(1, ErrorKind::Cancelled, None),
+            transport_sample(2, ErrorKind::Cancelled, None),
+        ];
+        let aggregate = ProbeAggregate::from_samples(ProbeType::Https, &samples);
+        assert_eq!(aggregate.cancelled_count, 2);
+        assert_eq!(aggregate.executed_total(), 0);
+        assert!(aggregate.transport_failure_rate().is_none());
+        assert_eq!(aggregate.request_failure_rate, 0.0);
+    }
+
+    #[test]
+    fn progress_payload_serializes_snake_case() {
+        let payload = ProgressPayload {
+            job_id: "job-1".to_string(),
+            percent: 40,
+            status: ProgressStatus::SampleFinished,
+            message: None,
+            sample: None,
+        };
+        let out = serde_json::to_string(&payload).unwrap();
+        assert!(out.contains("\"job_id\":\"job-1\""));
+        assert!(out.contains("\"status\":\"sample_finished\""));
+    }
+
+    #[test]
+    fn now_rfc3339_is_utc_zulu() {
+        let stamp = now_rfc3339();
+        assert!(stamp.ends_with('Z'), "应为 Z 后缀 UTC：{stamp}");
+        assert!(stamp.contains('T'));
     }
 
     #[test]

@@ -66,7 +66,10 @@ export interface ProbeSample {
 
 export interface ProbeAggregate {
   probe_type: ProbeType;
+  /** 全部样本数（含已取消）。 */
   attempts_total: number;
+  /** 取消/截止未完成的样本：不进入失败率分母（D-014）。 */
+  cancelled_count: number;
   success_count: number;
   transport_failure_count: number;
   http_response_count: number;
@@ -107,6 +110,29 @@ export interface JobHandle {
 
 export interface CancelOutcome {
   cancelled: boolean;
+}
+
+/** diagnostic://progress 事件载荷。 */
+export type ProgressStatus = 'running' | 'sample_finished';
+
+export interface ProgressPayload {
+  job_id: string;
+  percent: number;
+  status: ProgressStatus;
+  message: string | null;
+  sample: ProbeSample | null;
+}
+
+/** diagnostic://completed 事件载荷（含已取消状态，run.status 区分）。 */
+export interface CompletedPayload {
+  job_id: string;
+  run: DiagnosticRun;
+}
+
+/** diagnostic://failed 事件载荷：任务级失败。 */
+export interface FailedPayload {
+  job_id: string;
+  error: IpcError;
 }
 
 export interface AdapterSummary {

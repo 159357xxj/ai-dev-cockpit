@@ -157,21 +157,23 @@ struct ProbeSample {
   tested_at: String,                  // RFC3339 UTC
 }
 
-// —— 每目标 × 每探测类型聚合（Phase 1 修订：拆分"传输失败"与"非 2xx 响应"，见 D-011）——
+// —— 每目标 × 每探测类型聚合（D-011 口径 + Phase 2 D-014 取消口径）——
 struct ProbeAggregate {
   probe_type: ProbeType,
-  attempts_total: u32,
+  attempts_total: u32,                // 全部样本（含已取消）
+  cancelled_count: u32,               // 用户取消/截止未完成：不进入任何失败率分母（D-014）
   success_count: u32,                 // https: 仅 2xx；dns/tcp: 成功
-  transport_failure_count: u32,       // 传输层失败：未收到任何 HTTP 响应（dns/tcp 未连通、TLS/超时/代理不可用/取消）
+  transport_failure_count: u32,       // 传输层失败：未收到任何 HTTP 响应（不含已取消样本）
   http_response_count: u32,           // 收到 HTTP 响应的样本数（任意状态码；仅 https 可能 >0）
-  request_failure_rate: f64,          // (attempts_total - success_count) / attempts_total —— PRD 口径的"请求失败率"
-  duration_min_ms / duration_median_ms / duration_max_ms: Option<u64>, // 仅统计完成请求；超时样本不进入耗时统计
+  request_failure_rate: f64,          // (executed_total - success_count) / executed_total
+  duration_min_ms / duration_median_ms / duration_max_ms: Option<u64>, // 仅成功样本有耗时
 }
 // 逐样本互斥分类（恒等式）：
-//   attempts_total = success_count + transport_failure_count + non_2xx_count
+//   attempts_total = success_count + transport_failure_count + non_2xx_count + cancelled_count
 //   其中 non_2xx_count = http_response_count - success_count（仅 https 有意义；dns/tcp 恒为 0）
+//   executed_total = attempts_total - cancelled_count（各失败率的分母）
 // 派生比率由展示层计算，分母不同，禁止合并成一个口径：
-//   传输失败率     = transport_failure_count / attempts_total   （链路通不通）
+//   传输失败率     = transport_failure_count / executed_total   （链路通不通；全取消时为"不适用"）
 //   非 2xx 响应比例 = non_2xx_count / http_response_count        （服务端给出什么答案）
 
 struct DiagnosticRun {
@@ -227,11 +229,12 @@ struct ProxySnapshot { user_proxy: UserProxyInfo, env_vars: Vec<EnvVarInfo>, cap
 
 禁止事项：不把 401/403/429/5xx 翻译成"服务正常/异常"的二元结论；不把 `tcp` 耗时称作 ICMP RTT；不把"请求失败率"称作"丢包率"。
 
-### 6.3 指标口径（Phase 1 冻结，见 D-011）
-- **传输失败率** = `transport_failure_count / attempts_total`：样本未到达 HTTP 响应层（DNS/TCP/TLS 失败、超时、代理不可用、取消）的比例，衡量"链路通不通"。
+### 6.3 指标口径（D-011 + Phase 2 D-014 修订）
+- **传输失败率** = `transport_failure_count / executed_total`：样本未到达 HTTP 响应层（DNS/TCP/TLS 失败、超时、代理不可用）的比例，衡量"链路通不通"。**用户取消与任务截止不计入分母与分子**（D-014）。
 - **非 2xx 响应比例** = `non_2xx_count / http_response_count`：在**收到响应**的样本中非 2xx 状态码的占比，衡量"服务端给出什么答案"。
-- 两者分母不同（`attempts_total` vs `http_response_count`），**禁止合并为一个"失败率"口径展示**。PRD 的 `request_failure_rate`（`(total-success)/total`）作为总览指标保留，但界面必须同时给出上述两个拆分口径。
-- 耗时统计（min/median/max）仅包含"完成"的请求；超时样本的耗时是"超时事实"，不得进入耗时分布。
+- 两者分母不同（`executed_total` vs `http_response_count`），**禁止合并为一个"失败率"口径展示**。PRD 的 `request_failure_rate`（`(executed-success)/executed`）作为总览指标保留，但界面必须同时给出上述两个拆分口径。
+- **耗时分布只包含成功样本**（`duration_ms` 仅在 `success=true` 时有值）：失败/超时/取消一律为 None——失败瞬时返回（如拒连 ~0ms）不得拉低最小值。
+- 取消语义（Phase 2 冻结）：取消/截止前**未开始**的任务不产生样本；**在途**任务产生 `cancelled` 样本并保留展示；已完成的样本原样保留。
 
 ## 7. 探测语义与路由模式（冻结）
 

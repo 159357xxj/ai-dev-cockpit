@@ -15,7 +15,7 @@ describe('演示模式标识与开关', () => {
 
     expect(screen.queryAllByText('演示数据')).toHaveLength(0);
     expect(screen.queryByText(/演示模式已开启/)).not.toBeInTheDocument();
-    expect(screen.getByText(/系统快照将在 Phase 2 提供/)).toBeInTheDocument();
+    expect(screen.getByText(/系统快照将在后续阶段提供/)).toBeInTheDocument();
   });
 
   it('开启后显示演示横幅、徽标与模拟内容', () => {
@@ -62,6 +62,6 @@ describe('演示模式标识与开关', () => {
 
     // 未选超时默认合法；模拟推进由定时器驱动，取消后状态固定为已取消
     await user.click(screen.getByRole('button', { name: /取消/ }));
-    expect(await screen.findByText('已取消')).toBeInTheDocument();
+    expect(await screen.findByText(/已取消/)).toBeInTheDocument();
   });
 });
