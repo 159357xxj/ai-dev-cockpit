@@ -1,0 +1,20 @@
+# Node / 前端
+node_modules/
+dist/
+coverage/
+*.local
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# 日志与临时文件
+*.log
+tmp/
+
+# 编辑器与工具本地状态
+.zcode/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
