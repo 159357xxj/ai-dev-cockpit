@@ -21,10 +21,11 @@ pub async fn probe_tcp(
     route_mode: RouteMode,
     timeout: Duration,
     cancel: CancellationToken,
+    resolver: &super::dns::Resolver,
 ) -> ProbeSample {
     // 前置解析不计时：让 TCP 耗时只包含建连本身。
-    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
-        Ok(addrs) => addrs.collect(),
+    let addrs: Vec<SocketAddr> = match resolver(host.to_string(), port).await {
+        Ok(addrs) => addrs,
         Err(error) => {
             return failure_sample(
                 target_id,

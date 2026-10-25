@@ -247,15 +247,23 @@ struct ProxySnapshot { user_proxy: UserProxyInfo, env_vars: Vec<EnvVarInfo>, cap
 
 | mode | 行为 | 必须展示的说明 |
 |---|---|---|
-| `library_default` | Reqwest 默认行为（读环境变量及构建特性决定的系统代理源；**实际代理源在 Phase 3 用本地 mock 实测后在此固化**） | 不保证与任何特定桌面应用行为一致 |
+| `library_default` | Reqwest 0.12.28 默认（`system-proxy` 特性默认启用）。**优先级链（源码实证 + mock 实测，D-019）**：`HTTPS_PROXY`/`HTTP_PROXY` > `ALL_PROXY` > 注册表 `ProxyServer`（需 `ProxyEnable=1`）；绕行：`NO_PROXY` env 优先，未设时用注册表 `ProxyOverride`（两槽位独立）；CGI 环境（`REQUEST_METHOD` 存在）env 全失效；**PAC 不参与** | 不保证与任何特定桌面应用行为一致；本机系统代理（如 Clash）的例外列表会直接影响它 |
 | `no_app_proxy` | 构建客户端时显式 `no_proxy()` | 仅指不使用应用层显式代理；TUN/透明代理仍可能生效；**绝不声称"未经过代理"** |
 | `manual_local_proxy` | 仅 HTTPS 走用户指定 loopback 代理 | 仅接受 `http://`、`socks5://`、`socks5h://`（socks5=本地解析域名，socks5h=由代理解析域名，差异须展示）；代理失败 → `proxy_unavailable`，**绝不静默回落**；DNS/TCP 显示"不适用（独立基线）" |
 
 ### 7.3 请求策略
 - 方法：HEAD 优先；405 时允许**一次** GET 回退，响应体读取上限 64 KiB 后丢弃。
 - 重定向：最多 5 次；到达上限仍 3xx → `redirect_3xx`。
-- 超时：单请求 `timeout_ms`（≤10s）；任务全局截止 120s；HTTPS 并发 ≤3；重试：无。
+- 超时：单请求 `timeout_ms`（≤10s）；任务全局截止 120s；HTTPS 并发 ≤3；重试：无（`.retry(never())` 显式禁用 reqwest 默认 h2/h3 NACK 重试，D-018）。
 - 取消：`CancellationToken`，取消后未完成样本记 `cancelled`，已落库数据不回填、不伪造。
+- manual_local_proxy 不可达：`proxy_unavailable`（含代理 407 / SOCKS 连接失败），绝不回落直连（D-005，mock 实测守护）。
+
+### 7.4 Windows 代理配置快照（Phase 3）
+三来源分别检测、分别标注（`platform/windows/proxy.rs`，全部只读 API）：
+1. 用户 WinINet 配置（`WinHttpGetIEProxyConfigForCurrentUser`）：手动代理 / PAC URL / 自动检测；
+2. WinHTTP 机器级配置（`WinHttpGetDefaultProxyConfiguration`）；
+3. 环境变量（`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` 及小写，存在状态 + 脱敏值）。
+读取失败 → `status="unknown"`（不伪造"未启用"）；所有值经 `security::redaction` 脱敏出进程；PAC 仅展示 URL 不下载不执行；**配置存在 ≠ 真实请求使用**（各应用解析规则不同）。
 
 ## 8. 存储设计预览（Phase 5 实现）
 

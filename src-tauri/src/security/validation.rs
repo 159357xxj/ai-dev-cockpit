@@ -45,8 +45,14 @@ pub fn validate_manual_proxy_url(raw: &str) -> Result<ValidatedProxy, String> {
 
     match parsed.host() {
         Some(url::Host::Ipv4(ip)) if ip.octets() == [127, 0, 0, 1] => {}
-        Some(url::Host::Domain(domain)) if domain.eq_ignore_ascii_case("localhost") => {}
         Some(url::Host::Ipv6(ip)) if ip == std::net::Ipv6Addr::LOCALHOST => {}
+        // 注意：url crate 对非特殊 scheme（socks5/socks5h）不做 IPv4 主机解析，
+        // "127.0.0.1" 会保留为 Domain 形态——必须在此按字符串接受。
+        Some(url::Host::Domain(domain))
+            if matches!(
+                domain.to_ascii_lowercase().as_str(),
+                "localhost" | "127.0.0.1" | "[::1]"
+            ) => {}
         other => {
             return Err(format!(
                 "代理主机仅允许 127.0.0.1 / localhost / [::1]，收到：{other:?}"
@@ -64,7 +70,7 @@ pub fn validate_manual_proxy_url(raw: &str) -> Result<ValidatedProxy, String> {
     let host_display = match parsed.host() {
         Some(url::Host::Ipv6(_)) => "[::1]".to_string(),
         Some(url::Host::Ipv4(ip)) => ip.to_string(),
-        Some(url::Host::Domain(domain)) => domain.to_string(),
+        Some(url::Host::Domain(domain)) => domain.to_ascii_lowercase(),
         None => return Err("代理地址缺少主机".to_string()),
     };
 

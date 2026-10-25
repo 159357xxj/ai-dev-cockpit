@@ -21,15 +21,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
+#[allow(dead_code)]
 pub struct MockServer {
     pub port: u16,
     max_active: Arc<AtomicUsize>,
     total_written: Arc<AtomicUsize>,
     write_failed: Arc<AtomicBool>,
+    total_connections: Arc<AtomicUsize>,
     shutdown: CancellationToken,
     handle: tokio::task::JoinHandle<()>,
 }
 
+#[allow(dead_code)]
 impl MockServer {
     pub async fn spawn() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -40,6 +43,7 @@ impl MockServer {
         let max_active = Arc::new(AtomicUsize::new(0));
         let total_written = Arc::new(AtomicUsize::new(0));
         let write_failed = Arc::new(AtomicBool::new(false));
+        let total_connections = Arc::new(AtomicUsize::new(0));
         let shutdown = CancellationToken::new();
 
         let shutdown_loop = shutdown.clone();
@@ -47,6 +51,7 @@ impl MockServer {
         let max_loop = max_active.clone();
         let written_loop = total_written.clone();
         let failed_loop = write_failed.clone();
+        let conn_total_loop = total_connections.clone();
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -57,7 +62,9 @@ impl MockServer {
                             let max = max_loop.clone();
                             let written = written_loop.clone();
                             let failed = failed_loop.clone();
+                            let conn_total = conn_total_loop.clone();
                             tokio::spawn(async move {
+                                conn_total.fetch_add(1, Ordering::SeqCst);
                                 active.fetch_add(1, Ordering::SeqCst);
                                 let now = active.load(Ordering::SeqCst);
                                 max.fetch_max(now, Ordering::SeqCst);
@@ -76,6 +83,7 @@ impl MockServer {
             max_active,
             total_written,
             write_failed,
+            total_connections,
             shutdown,
             handle,
         }
@@ -96,6 +104,11 @@ impl MockServer {
     /// 是否出现过对端提前断开导致的写失败（用于验证客户端读体上限）。
     pub fn write_failed(&self) -> bool {
         self.write_failed.load(Ordering::SeqCst)
+    }
+
+    /// 累计接受的连接数（验证"一次采样 = 恰好一次请求"，无隐式重试）。
+    pub fn total_connections(&self) -> usize {
+        self.total_connections.load(Ordering::SeqCst)
     }
 
     pub async fn shutdown(self) {
@@ -286,3 +299,5 @@ async fn write_ok(stream: &mut TcpStream, bytes: &[u8], total_written: &Arc<Atom
         Err(_) => false,
     }
 }
+
+pub mod proxy_mock;

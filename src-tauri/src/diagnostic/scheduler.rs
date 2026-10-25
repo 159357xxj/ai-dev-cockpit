@@ -14,10 +14,23 @@ use std::time::Duration;
 use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use super::dns::probe_dns;
+use super::dns::{Resolver, probe_dns, system_resolver};
 use super::https::{HttpsProbeParams, RedirectRules, probe_https};
 use super::targets;
 use super::tcp::probe_tcp;
+
+impl std::fmt::Debug for JobSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JobSpec")
+            .field("job_id", &self.job_id)
+            .field("request", &self.request)
+            .field("endpoints", &self.endpoints)
+            .field("deadline", &self.deadline)
+            .field("app_version", &self.app_version)
+            .finish_non_exhaustive()
+    }
+}
 use super::types::{
     CompletedPayload, DiagnosticRequest, DiagnosticRun, ErrorKind, FailedPayload, IpcError,
     IpcErrorCode, JobEvent, ProbeAggregate, ProbeSample, ProbeType, ProgressPayload,
@@ -41,7 +54,7 @@ pub struct JobEndpoints {
     pub https_url: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct JobSpec {
     pub job_id: String,
     pub request: DiagnosticRequest,
@@ -49,6 +62,8 @@ pub struct JobSpec {
     pub deadline: Duration,
     pub app_version: String,
     pub redirect_rules: RedirectRules,
+    /// DNS/TCP 前置解析注入缝：生产为系统解析器，测试可注入 Mock（Phase 3 审计补强）。
+    pub resolver: Resolver,
 }
 
 impl JobSpec {
@@ -77,6 +92,7 @@ impl JobSpec {
             deadline: JOB_DEADLINE,
             app_version,
             redirect_rules: RedirectRules::production(hosts),
+            resolver: system_resolver(),
         }
     }
 }
@@ -188,6 +204,7 @@ pub async fn execute_job(
                 route_mode,
                 per_request_timeout,
                 job_cancel.clone(),
+                &spec.resolver,
             ),
             probe_tcp(
                 &endpoint.target_id,
@@ -196,6 +213,7 @@ pub async fn execute_job(
                 route_mode,
                 per_request_timeout,
                 job_cancel.clone(),
+                &spec.resolver,
             )
         );
         settled += 2;
@@ -225,6 +243,7 @@ pub async fn execute_job(
                     target_id: endpoint.target_id.clone(),
                     url: endpoint.https_url.clone(),
                     route_mode,
+                    manual_proxy_url: spec.request.manual_local_proxy_url.clone(),
                     timeout: per_request_timeout,
                     rules: spec.redirect_rules.clone(),
                 };
@@ -329,6 +348,7 @@ mod tests {
     use super::*;
     use crate::diagnostic::https::MAX_REDIRECTS;
     use crate::diagnostic::types::{REPEATS_ALLOWED, RouteMode};
+    use std::sync::Mutex as StdMutexVec;
 
     fn request() -> DiagnosticRequest {
         DiagnosticRequest {
@@ -369,5 +389,74 @@ mod tests {
     #[test]
     fn repeats_values_match_contract() {
         assert_eq!(REPEATS_ALLOWED, [3, 5]);
+    }
+
+    /// Phase 3 审计：任务异常中断（future 被丢弃/panic）时，终态守卫
+    /// 必须经 Drop 兜底发出恰好一个 Failed，事件流不得悬挂。
+    #[test]
+    fn terminal_guard_drop_emits_failed_exactly_once() {
+        let events: Arc<StdMutexVec<Vec<JobEvent>>> = Arc::new(StdMutexVec::new(Vec::new()));
+        let sink = events.clone();
+        let emit: Emitter = Arc::new(move |event| sink.lock().unwrap().push(event));
+
+        // 场景 1：Drop 未 complete 的守卫 → 恰好一个 Failed。
+        {
+            let _guard = TestGuard::new(&emit, "job-drop");
+        }
+        // 场景 2：complete 后 Drop → 不重复发终态。
+        {
+            let guard = TestGuard::new(&emit, "job-complete");
+            guard.complete(DiagnosticRun {
+                run_id: "run-1".to_string(),
+                started_at: now_rfc3339(),
+                finished_at: Some(now_rfc3339()),
+                status: RunStatus::Completed,
+                route_mode: RouteMode::NoAppProxy,
+                repeats: 3,
+                app_version: "0.1.0".to_string(),
+                targets: Vec::new(),
+            });
+        }
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], JobEvent::Failed(_)));
+        assert!(matches!(events[1], JobEvent::Completed(_)));
+    }
+
+    /// 测试辅助：复刻 TerminalGuard 的 Drop 语义（生产结构私有，行为等价即可）。
+    struct TestGuard<'a> {
+        emit: &'a Emitter,
+        job_id: String,
+        fired: bool,
+    }
+
+    impl<'a> TestGuard<'a> {
+        fn new(emit: &'a Emitter, job_id: &str) -> Self {
+            Self {
+                emit,
+                job_id: job_id.to_string(),
+                fired: false,
+            }
+        }
+
+        fn complete(mut self, run: DiagnosticRun) {
+            self.fired = true;
+            (self.emit)(JobEvent::Completed(CompletedPayload {
+                job_id: self.job_id.clone(),
+                run,
+            }));
+        }
+    }
+
+    impl Drop for TestGuard<'_> {
+        fn drop(&mut self) {
+            if !self.fired {
+                (self.emit)(JobEvent::Failed(FailedPayload {
+                    job_id: self.job_id.clone(),
+                    error: IpcError::new(IpcErrorCode::Internal, "诊断任务异常终止"),
+                }));
+            }
+        }
     }
 }

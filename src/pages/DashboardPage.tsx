@@ -11,6 +11,7 @@ import {
 } from 'recharts';
 
 import { DemoBadge, DemoBanner } from '@/components/layout/demo';
+import { ProxySnapshotCard } from '@/components/dashboard/ProxySnapshotCard';
 import { EmptyState } from '@/components/layout/states';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Button } from '@/components/ui/button';
@@ -135,6 +136,10 @@ export function DashboardPage() {
           description="本页面当前不读取系统信息、不发起任何网络请求。真实只读快照由后续阶段接入；网络探测已在「服务诊断」页可用，可在「设置」中开启演示模式查看界面形态。"
         />
       )}
+
+      <div className="mt-4">
+        <ProxySnapshotCard />
+      </div>
 
       <Card className="mt-4">
         <CardHeader>

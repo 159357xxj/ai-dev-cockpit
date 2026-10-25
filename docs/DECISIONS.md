@@ -103,5 +103,22 @@
 | R6 | 本机 WebView2 注册表标准键缺失（文件系统已证实安装） | 低 | P6 复核 NSIS bootstrap 判据，不用注册表键做唯一判据 | 已记录 |
 | R7 | Node 24 / Rust 1.97 较新的依赖兼容性 | 低 | 锁文件固定；CI 覆盖 | 持续观察 |
 
+## D-017 耗时口径修订：收到响应即保留真实耗时（Phase 3，细化 D-014）
+- 背景：Phase 2 曾规定"耗时仅成功样本"；Phase 3 审计指出收到 401/403/5xx 的请求同样是**完成的 HTTP 事务**，丢弃其耗时丢失了服务端响应性证据；而真正会扭曲分布的是传输失败（拒连 ~0ms）与未完成（超时/取消）。
+- 决定：`duration_ms` 在"收到 HTTP 响应（任意状态码）"或"dns/tcp 成功"时有值；传输失败/超时/取消一律 None。耗时分布 = 完成事务的分布。
+- 后果：types.rs 与 metrics.ts 测试同步修订；不推翻 D-014 的取消/传输失败分母规则。
+
+## D-018 显式禁用 Reqwest 默认隐式重试（Phase 3，源码实证）
+- 背景：审计发现锁定的 reqwest 0.12.28 默认把客户端包进 `tower::retry::Retry`（`Builder::default()` → `Classifier::ProtocolNacks`），对 **HTTP/2/3 协议层 NACK**（`h2::Error` 的 REFUSED_STREAM/GOAWAY 等）会静默重发请求——与"一次采样 = 恰好一次请求"契约冲突（http2 为默认特性）。
+- 决定：所有模式的客户端显式 `.retry(reqwest::retry::never())`（reqwest 官方 API，文档原文"disable the Client's default behavior of retrying protocol nacks"）；连接错误/超时/HTTP 状态码本就不在默认重试范围（源码 `is_retryable_error` 仅匹配 h2/h3 错误）。测试以"mock 立即断开 → 服务端只看到 1 次连接"守护。
+- 后果：采样语义严格；若未来升级 reqwest 需复查该默认值（风险登记表持续跟踪）。
+
+## D-019 Windows 代理快照来源与 library_default 语义（Phase 3，源码实证 + 实测）
+- 决定：
+  1. 代理快照三来源分别标注：用户 WinINet 配置（`WinHttpGetIEProxyConfigForCurrentUser`）、WinHTTP 机器级配置（`WinHttpGetDefaultProxyConfiguration`）、代理相关环境变量；读取失败一律 `status="unknown"`，绝不伪造"未启用"；全量脱敏（`security::redaction`）后才出进程；PAC 只展示 URL，**不下载不执行**。
+  2. `library_default` 的实际代理解析链（reqwest 0.12.28 → hyper-util 0.1.21 `Matcher::from_system`，源码实证 + 本机 mock 实测）：**`HTTPS_PROXY`/`HTTP_PROXY` > `ALL_PROXY` > 注册表 `ProxyServer`（需 `ProxyEnable=1`）**；绕行列表：**`NO_PROXY` 环境变量优先，未设时用注册表 `ProxyOverride`**（两槽位独立！）；`REQUEST_METHOD` 存在（CGI）时 env 代理全部失效；**PAC/AutoConfigURL 完全不参与**。
+  3. 本机实测：系统代理开启（Clash 系 127.0.0.1:7890）且 `ProxyOverride` 含 `127.*` 时，library_default 对 127.0.0.1 目标即使设置了 `HTTPS_PROXY` 也直连（`no` 槽位被注册表例外占据）——该行为已固化为条件执行的观测测试。
+- 后果：ARCHITECTURE §7.2 已固化；`no_app_proxy` 不受 env/注册表影响的反向证明完成。
+
 ## 变更流程
 新决策追加新编号条目（如 D-011）；推翻旧决策时新条目标注"替代 D-xxx"，旧条目状态改为"已替代（见 D-xxx）"。

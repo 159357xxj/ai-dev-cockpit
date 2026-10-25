@@ -3,11 +3,12 @@
 //! 只读诊断工具：所有网络探测、系统信息读取、持久化与脱敏导出都在本进程内完成；
 //! 前端仅通过白名单 IPC 调用（docs/ARCHITECTURE.md）。
 
-// diagnostic 设为 pub：集成测试（tests/probes_e2e.rs）直接驱动调度器与探测函数；
-// commands / security 保持私有，命令面仅经 Tauri 白名单暴露。
+// diagnostic / platform / security 设为 pub：集成测试直接驱动调度器、探测函数、
+// Windows 代理快照（只读）与脱敏/校验规则；commands 保持私有，命令面仅经 Tauri 白名单暴露。
 mod commands;
 pub mod diagnostic;
-mod security;
+pub mod platform;
+pub mod security;
 
 use std::sync::Arc;
 
@@ -33,6 +34,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::system::get_system_snapshot,
+            commands::system::get_proxy_snapshot,
             commands::diagnostics::start_diagnostic,
             commands::diagnostics::cancel_diagnostic,
         ])

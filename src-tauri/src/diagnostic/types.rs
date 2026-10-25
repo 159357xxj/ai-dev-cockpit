@@ -204,8 +204,10 @@ pub struct ProbeSample {
     pub attempt_no: u32,
     /// https：仅 2xx 为 true；dns/tcp：连通/解析成功即 true。
     pub success: bool,
-    /// 耗时仅在 `success=true` 时有值；失败/超时/取消一律 None——
-    /// 耗时分布因此是"成功请求的耗时分布"，失败瞬时返回不会拉低最小值。
+    /// 耗时口径（D-017）：
+    /// - https：只要收到 HTTP 响应（任意状态码，含 401/403/5xx）即保留真实耗时；
+    /// - dns/tcp：成功时保留耗时；
+    /// - 传输失败/超时/取消一律 None——未完成的测量不得进入耗时分布。
     pub duration_ms: Option<u64>,
     pub http_status: Option<u16>,
     pub http_outcome: Option<HttpOutcome>,
@@ -477,34 +479,67 @@ pub struct SystemSnapshot {
     pub captured_at: String,
 }
 
-// Phase 3 契约预览：Windows 代理快照 DTO 先行冻结，Phase 3 由 platform/windows 填充。
-// 本 crate 含 staticlib/cdylib 目标，未构造的 pub 结构体会被判 dead_code，故显式豁免。
-#[allow(dead_code)]
+/// 来源 1：当前用户 WinINet 代理配置（Phase 3 实装）。
+/// `status="ok"` 时各 Option 有意义（None=确认未配置）；
+/// `status="unknown"` 时全部 Option=None——**读取失败绝不伪造"未启用"**。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserProxyInfo {
-    /// 已脱敏的手动代理字符串（隐藏可能的 userinfo/token）。
+pub struct WindowsUserProxyInfo {
+    /// 数据来源标签（如 `wininet_api:WinHttpGetIEProxyConfigForCurrentUser`）。
+    pub source: String,
+    /// RFC3339 UTC。
+    pub captured_at: String,
+    /// "ok" | "unknown"。
+    pub status: String,
+    pub read_error: Option<String>,
+    /// 自动检测（AutoDetect）状态。
+    pub auto_detect: Option<bool>,
+    /// PAC 自动配置 URL（脱敏后；仅展示，本工具不下载/不执行脚本）。
+    pub pac_url: Option<String>,
+    /// 手动代理服务器（脱敏后，可能为 per-protocol 格式）。
     pub manual_proxy: Option<String>,
-    pub pac_configured: bool,
-    pub auto_detect: bool,
-    pub note: String,
+    /// 代理例外列表。
+    pub proxy_bypass: Option<String>,
 }
 
-#[allow(dead_code)]
+/// 来源 2：WinHTTP 默认代理配置（机器级，`netsh winhttp` 所设置的值）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WinHttpProxyInfo {
+    pub source: String,
+    /// RFC3339 UTC。
+    pub captured_at: String,
+    /// "ok" | "unknown"。
+    pub status: String,
+    pub read_error: Option<String>,
+    /// "default" | "direct" | "named_proxy" | "other(n)"。
+    pub access_type: Option<String>,
+    pub proxy: Option<String>,
+    pub bypass: Option<String>,
+}
+
+/// 来源 3：代理相关环境变量（存在状态 + 脱敏值）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvVarInfo {
     pub name: String,
-    pub value_redacted: String,
-    pub origin: String,
+    pub present: bool,
+    /// Some = 已设置（脱敏值）；None = 未设置或为空。
+    pub value_redacted: Option<String>,
+    pub note: String,
 }
 
-/// Windows 用户级代理快照（只读，Phase 3 起提供）。
-#[allow(dead_code)]
+/// Windows 代理配置只读快照：三个来源分别检测、分别标注（Phase 3）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxySnapshot {
-    pub user_proxy: UserProxyInfo,
+    pub user_settings: WindowsUserProxyInfo,
+    pub winhttp: WinHttpProxyInfo,
     pub env_vars: Vec<EnvVarInfo>,
+    /// 便捷布尔：仅对应来源 status=ok 时有效，否则 None（未知）。
+    pub manual_proxy_enabled: Option<bool>,
+    pub pac_configured: Option<bool>,
+    pub auto_detect_enabled: Option<bool>,
     /// RFC3339 UTC。
     pub captured_at: String,
+    /// 免责说明（配置存在 ≠ 真实请求使用；PAC 不下载不执行）。
+    pub note: String,
 }
 
 #[cfg(test)]
@@ -685,11 +720,11 @@ mod tests {
 
     #[test]
     fn aggregate_splits_transport_failures_from_http_responses() {
-        // 5 个 https 样本：2×200 成功、1×401、1×TCP 失败、1×超时（无 duration）。
+        // 5 个 https 样本：2×200 成功、1×401（保留真实耗时，D-017）、1×TCP 失败、1×超时。
         let samples = vec![
             http_sample(1, Some(200), true, Some(100)),
             http_sample(2, Some(200), true, Some(200)),
-            http_sample(3, Some(401), false, None),
+            http_sample(3, Some(401), false, Some(300)),
             transport_sample(4, ErrorKind::TcpFailure, None),
             transport_sample(5, ErrorKind::Timeout, None),
         ];
@@ -705,10 +740,11 @@ mod tests {
         let ratio = aggregate.non_2xx_response_ratio().expect("https 有响应");
         assert!((ratio - 1.0 / 3.0).abs() < 1e-9);
 
-        // 耗时分布只含成功样本（401/失败/超时均为 None）。
+        // 耗时分布含"收到响应"的样本（2xx 与 401，D-017）；
+        // 传输失败/超时/取消无耗时，不进入分布。
         assert_eq!(aggregate.duration_min_ms, Some(100));
-        assert_eq!(aggregate.duration_median_ms, Some(150));
-        assert_eq!(aggregate.duration_max_ms, Some(200));
+        assert_eq!(aggregate.duration_median_ms, Some(200));
+        assert_eq!(aggregate.duration_max_ms, Some(300));
     }
 
     #[test]

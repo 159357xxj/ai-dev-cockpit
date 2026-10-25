@@ -135,6 +135,47 @@ export interface FailedPayload {
   error: IpcError;
 }
 
+/** Windows 代理配置快照（三个来源分别标注；Phase 3）。 */
+export interface WindowsUserProxyInfo {
+  source: string;
+  captured_at: string;
+  /** "ok" | "unknown"；unknown 时各字段 None（读取失败绝不伪造"未启用"）。 */
+  status: string;
+  read_error: string | null;
+  auto_detect: boolean | null;
+  pac_url: string | null;
+  manual_proxy: string | null;
+  proxy_bypass: string | null;
+}
+
+export interface WinHttpProxyInfo {
+  source: string;
+  captured_at: string;
+  status: string;
+  read_error: string | null;
+  access_type: string | null;
+  proxy: string | null;
+  bypass: string | null;
+}
+
+export interface EnvVarInfo {
+  name: string;
+  present: boolean;
+  value_redacted: string | null;
+  note: string;
+}
+
+export interface ProxySnapshot {
+  user_settings: WindowsUserProxyInfo;
+  winhttp: WinHttpProxyInfo;
+  env_vars: EnvVarInfo[];
+  manual_proxy_enabled: boolean | null;
+  pac_configured: boolean | null;
+  auto_detect_enabled: boolean | null;
+  captured_at: string;
+  note: string;
+}
+
 export interface AdapterSummary {
   name: string;
   adapter_type: string | null;

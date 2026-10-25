@@ -8,6 +8,7 @@ import { listen } from '@tauri-apps/api/event';
 import type {
   CancelOutcome,
   CompletedPayload,
+  ProxySnapshot,
   DiagnosticRequest,
   FailedPayload,
   IpcError,
@@ -59,6 +60,10 @@ export const api = {
   /** 系统快照（后续阶段返回真实数据；当前返回 not_available）。 */
   getSystemSnapshot: (): Promise<SystemSnapshot> =>
     callIpc<SystemSnapshot>('get_system_snapshot'),
+
+  /** Windows 代理配置只读快照（Phase 3：三来源分别标注，全量脱敏，纯本地读取）。 */
+  getProxySnapshot: (): Promise<ProxySnapshot> =>
+    callIpc<ProxySnapshot>('get_proxy_snapshot'),
 
   /** 启动诊断（低层句柄：一般应使用 runDiagnostic 以获得事件流）。 */
   startDiagnostic: (request: DiagnosticRequest): Promise<JobHandle> =>

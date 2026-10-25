@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use ai_dev_cockpit_lib::diagnostic::dns::probe_dns;
+use ai_dev_cockpit_lib::diagnostic::dns::{probe_dns, system_resolver};
 use ai_dev_cockpit_lib::diagnostic::https::{HttpsProbeParams, RedirectRules, probe_https};
 use ai_dev_cockpit_lib::diagnostic::scheduler::{Emitter, JobEndpoints, JobSpec, execute_job};
 use ai_dev_cockpit_lib::diagnostic::tcp::probe_tcp;
@@ -42,6 +42,7 @@ fn https_params(server: &MockServer, path: &str, timeout: Duration) -> HttpsProb
         target_id: "mock-target".to_string(),
         url: server.url(path),
         route_mode: RouteMode::NoAppProxy,
+        manual_proxy_url: None,
         timeout,
         rules: rules_for(server),
     }
@@ -98,6 +99,7 @@ fn spec_for(
         deadline,
         app_version: "0.1.0".to_string(),
         redirect_rules: rules_for(server),
+        resolver: system_resolver(),
     }
 }
 
@@ -249,6 +251,7 @@ async fn tcp_refused_is_tcp_failure() {
         RouteMode::NoAppProxy,
         Duration::from_secs(5),
         CancellationToken::new(),
+        &system_resolver(),
     )
     .await;
     assert!(!sample.success);
@@ -266,6 +269,7 @@ async fn tls_handshake_against_plain_server_is_tls_failure() {
         target_id: "mock-target".to_string(),
         url: format!("https://127.0.0.1:{}/status/200", server.port),
         route_mode: RouteMode::NoAppProxy,
+        manual_proxy_url: None,
         timeout: Duration::from_secs(5),
         rules: rules_for(&server),
     };
@@ -288,6 +292,7 @@ async fn dns_localhost_resolves() {
         RouteMode::NoAppProxy,
         Duration::from_secs(3),
         CancellationToken::new(),
+        &system_resolver(),
     )
     .await;
     assert!(ok.success, "localhost 离线可解析");
@@ -466,4 +471,70 @@ async fn aggregate_matches_samples_exactly() {
         }
     }
     server.shutdown().await;
+}
+
+// —— Phase 3 审计补强：无隐式重试 / DNS 注入 ——
+
+#[tokio::test]
+async fn no_implicit_retry_single_connection_per_sample() {
+    // D-018：/close 立即断开——若存在隐式重试，服务端会看到第 2 次连接。
+    let server = MockServer::spawn().await;
+    let before = server.total_connections();
+    let sample = probe(&server, "/close", Duration::from_secs(5)).await;
+    assert!(!sample.success, "服务端断开 → 请求失败");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        server.total_connections() - before,
+        1,
+        "一次采样必须恰好一次连接（retry(never()) 生效）"
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn mock_resolver_injection_produces_dns_failure() {
+    // Phase 3 审计：DNS 失败分类通过注入 Mock 解析器离线确定性验证。
+    use ai_dev_cockpit_lib::diagnostic::dns::{Resolver, probe_dns};
+    use std::sync::Arc;
+
+    let failing: Resolver = Arc::new(|_host, _port| {
+        Box::pin(async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "mock: NXDOMAIN",
+            ))
+        })
+    });
+
+    let sample = probe_dns(
+        "mock-target",
+        "whatever.example.com",
+        RouteMode::NoAppProxy,
+        Duration::from_secs(3),
+        CancellationToken::new(),
+        &failing,
+    )
+    .await;
+    assert!(!sample.success);
+    assert_eq!(
+        sample.error.as_ref().map(|error| error.kind),
+        Some(ErrorKind::DnsFailure)
+    );
+
+    // TCP 前置解析走同一注入缝：解析失败归类 dns_failure（与 TCP 结论分离）。
+    let tcp_sample = ai_dev_cockpit_lib::diagnostic::tcp::probe_tcp(
+        "mock-target",
+        "whatever.example.com",
+        443,
+        RouteMode::NoAppProxy,
+        Duration::from_secs(3),
+        CancellationToken::new(),
+        &failing,
+    )
+    .await;
+    assert!(!tcp_sample.success);
+    assert_eq!(
+        tcp_sample.error.as_ref().map(|error| error.kind),
+        Some(ErrorKind::DnsFailure)
+    );
 }

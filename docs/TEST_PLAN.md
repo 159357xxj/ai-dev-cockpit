@@ -58,12 +58,20 @@
   - 说明：HTTP 200 仅证明"收到响应"（D-007），不宣称登录/业务可用；实测命令与输出见 Phase 2 报告。
   - 断网场景与桌面应用内真实探测留待用户日常使用中观察（分类逻辑已由离线 E2E 覆盖）。
 
-### Phase 3（代理与对比）
-- [ ] 代理 URL 校验表驱动用例：合法 http/socks5/socks5h loopback；非法（userinfo、非 loopback host、无端口、path/query、错误 scheme）。
-- [ ] 手动代理指向未监听端口 → `proxy_unavailable`，**断言不存在回落路径**（对比同目标 `no_app_proxy` 结果不同或均独立失败）。
-- [ ] `library_default` 代理源实测记录（本地 mock 代理 + 环境变量开关），结论回写 ARCHITECTURE §7.2。
-- [ ] 代理快照脱敏：注入含 userinfo/token 的假配置值，断言展示层已遮蔽；未配置时不崩溃、显示"未启用/未知"。
-- [ ] 对比页只纳入 HTTPS 样本的断言；DNS/TCP 显示"独立基线/不适用"。
+### Phase 3（代理与对比）—— 已实现（Phase 3 交付）
+- [x] 代理 URL 校验表驱动（validation.rs，12 组）：合法 loopback http/socks5/socks5h（含 `[::1]`、大写 scheme）；非法（userinfo、非 loopback、无端口、path/query/fragment、错误 scheme、空串）；socks5 的 Domain 形态主机（url crate 非特殊 scheme 不解析 IPv4）已修复并测试。
+- [x] 手动代理不可达 → `proxy_unavailable` 且**绝不回落**：http/socks5/socks5h 三种 scheme × 死端口实测断言（目标 mock 活着但从未收到请求）。
+- [x] HTTP 代理行为（mock 正向代理）：绝对 URI 转发（证明"经过代理"）；CONNECT 隧道建立（隧道 200 + 终端 TLS 失败如实分类）；407 → `proxy_unavailable`。
+- [x] SOCKS 语义实证（mock SOCKS5 记录 ATYP）：socks5 → ATYP∈{1,4}（本地解析，回环地址）；socks5h → ATYP=3（域名交由代理解析）。
+- [x] `library_default` 优先级（源码实证 hyper-util 0.1.21 + 本机 mock 实测）：`HTTPS_PROXY` > `ALL_PROXY`（后者不得被使用）；env 代理生效；`NO_PROXY` env 优先于注册表 `ProxyOverride`；本机系统代理例外（127.*）导致直连的行为固化为条件观测测试。
+- [x] `no_app_proxy` 不受 `HTTPS_PROXY` 环境变量影响（反向证明）。
+- [x] 代理快照（platform/windows/proxy.rs）：三来源分别标注 + 真机只读 API 测试；脱敏单测（userinfo/scheme 前缀/per-protocol/query）；unknown 状态不伪造"未启用"（前端测试断言）。
+- [x] 界面：三模式选择/参数校验/对比统计/取消/错误状态/空态（compare-page.test.tsx + proxy-snapshot.test.tsx，前端 29 项全绿）。
+- [x] 真实环境测试（用户已授权"公网三模式对比"，2026-10-25 实测，`cargo test --test probes_public -- --ignored --nocapture`）：
+  - **no_app_proxy → github.com**：3/3 成功，200 `ok_2xx`，中位 332ms，传输失败 0；
+  - **library_default → github.com**：2/3 成功（1 次 TLS 握手抖动），200 中位 301ms——经本机系统代理（Clash 系 127.0.0.1:7890，与 D-019 源码分析一致：github.com 不在 ProxyOverride 例外中）；
+  - **manual_local_proxy(http://127.0.0.1:7890) → github.com**：2/3 成功（1 次 TLS 握手抖动），200 中位 330ms。
+  - 结论口径：三路径中位数差异在真实抖动范围内，**不构成某路径必然更快的结论**；200 仅代表"收到响应"（D-007）；未修改任何代理客户端配置。
 
 ### Phase 4（规则诊断）
 - [ ] 每条规则一个 fixture 样本 + 表驱动测试（DNS 失败、TCP 失败、TLS 失败、超时、401/403、407、429、5xx、代理不可用、样本不足的路径差异）。

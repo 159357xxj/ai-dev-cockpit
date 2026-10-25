@@ -335,19 +335,19 @@ export function DiagnosticsPage() {
                 }
               >
                 {(Object.keys(ROUTE_MODE_LABELS) as RouteMode[]).map((mode) => (
-                  <option
-                    key={mode}
-                    value={mode}
-                    disabled={!demoMode && mode !== 'no_app_proxy'}
-                  >
+                  <option key={mode} value={mode}>
                     {ROUTE_MODE_LABELS[mode]}
-                    {!demoMode && mode !== 'no_app_proxy' ? ' — Phase 3 提供' : ''}
                   </option>
                 ))}
               </Select>
-              {!demoMode ? (
+              {!demoMode && form.routeMode === 'library_default' ? (
                 <p className="text-xs text-muted-foreground">
-                  当前阶段仅支持 no_app_proxy（不配置应用层代理；系统 TUN/透明路由仍可能生效）。
+                  库默认：代理选择受环境变量与 Windows 系统配置影响（PAC 不参与）；不保证与任何特定桌面应用一致。
+                </p>
+              ) : null}
+              {!demoMode && form.routeMode === 'no_app_proxy' ? (
+                <p className="text-xs text-muted-foreground">
+                  无应用代理仅指不配置应用层 HTTP 代理；系统 TUN/透明路由仍可能生效。
                 </p>
               ) : null}
             </div>

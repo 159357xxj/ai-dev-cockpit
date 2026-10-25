@@ -130,13 +130,11 @@ describe('真实模式诊断页', () => {
     expect(await screen.findByText(/已取消（已完成样本保留）/)).toBeInTheDocument();
   });
 
-  it('Phase 3 模式在真实模式下禁用', () => {
+  it('Phase 3：三种连接模式在真实模式下全部可用', () => {
     renderDiagnostics();
-    const libraryOption = screen.getByRole('option', { name: /库默认/ }) as HTMLOptionElement;
-    const manualOption = screen.getByRole('option', { name: /手动本地代理/ }) as HTMLOptionElement;
-    expect(libraryOption.disabled).toBe(true);
-    expect(manualOption.disabled).toBe(true);
-    const noProxyOption = screen.getByRole('option', { name: /无应用代理/ }) as HTMLOptionElement;
-    expect(noProxyOption.disabled).toBe(false);
+    for (const label of [/库默认/, /手动本地代理/, /无应用代理/]) {
+      const option = screen.getByRole('option', { name: label }) as HTMLOptionElement;
+      expect(option.disabled).toBe(false);
+    }
   });
 });

@@ -1,8 +1,17 @@
 //! 独立 HTTPS 请求测量（docs/ARCHITECTURE.md §7.2/§7.3）。
 //!
-//! Phase 2 仅实现 `no_app_proxy`（客户端显式不配置应用层代理；TUN/透明路由
-//! 仍可能生效，绝不声称"绕过"）。`library_default` 与 `manual_local_proxy`
-//! 由命令层拒绝并提示 Phase 3 提供。
+//! 三种路由模式（Phase 3）：
+//! - `no_app_proxy`：客户端显式 `no_proxy()`；TUN/透明路由仍可能生效，绝不声称"绕过"；
+//! - `library_default`：Reqwest 默认代理解析（环境变量 + Windows 注册表，
+//!   优先级链源码实证见 ARCHITECTURE §7.2；PAC 不参与）；
+//! - `manual_local_proxy`：仅 loopback 的 http/socks5/socks5h（命令层 + 本模块双重校验），
+//!   不可达归类 `proxy_unavailable`，绝不回落（D-005）。
+//!
+//! 所有模式共同约束：
+//! - `.retry(never())` 显式禁用 Reqwest 默认的 h2/h3 协议 NACK 重试（D-018，源码实证）；
+//! - TLS 证书正常校验；目标/重定向白名单；无 Cookie/凭证；无隐式重试；
+//! - 收到 HTTP 响应（任意状态码）不是传输层错误（D-007）；
+//! - 耗时：收到响应即保留真实耗时，传输失败/超时/取消为 None（D-017）。
 //!
 //! 请求策略（冻结）：
 //! - 仅访问调用方给定的 URL；生产路径由 `targets.rs` 白名单保证 https + 公开地址，
@@ -71,6 +80,8 @@ pub struct HttpsProbeParams {
     /// 首个请求的 URL。生产路径由白名单保证 https；测试可指向本地 mock。
     pub url: String,
     pub route_mode: RouteMode,
+    /// 仅 `manual_local_proxy` 模式使用；`security::validation` 规则双重校验。
+    pub manual_proxy_url: Option<String>,
     pub timeout: Duration,
     pub rules: RedirectRules,
 }
@@ -175,36 +186,107 @@ fn classify_status(status: u16) -> (bool, HttpOutcome) {
     }
 }
 
-/// 执行一次 HTTPS 测量。
-pub async fn probe_https(params: &HttpsProbeParams, cancel: CancellationToken) -> ProbeSample {
-    let attempt_no = 1;
-    if params.route_mode != RouteMode::NoAppProxy {
-        return error_sample(
-            &params.target_id,
-            params.route_mode,
-            attempt_no,
-            ErrorKind::Internal,
-            "该连接模式未在本阶段支持（命令层应已拦截）".to_string(),
-            None,
-        );
-    }
-
-    let client = reqwest::Client::builder()
+/// 按路由模式构建 HTTP 客户端（所有模式共同：无隐式重试、受限重定向、正常 TLS 校验）。
+fn build_client(params: &HttpsProbeParams) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(params.timeout)
         .connect_timeout(params.timeout)
         .redirect(redirect_policy(params.rules.clone()))
-        .no_proxy()
-        .build();
-    let client = match client {
+        // D-018（源码实证）：reqwest 0.12 默认对 h2/h3 协议 NACK 隐式重试；
+        // 显式 never() 兑现"一次采样 = 恰好一次请求"的契约。
+        .retry(reqwest::retry::never());
+
+    match params.route_mode {
+        RouteMode::NoAppProxy => {
+            builder = builder.no_proxy();
+        }
+        // 依赖 Reqwest 默认代理解析：环境变量 > Windows 注册表（需 ProxyEnable=1）；
+        // PAC 不参与。优先级链源码实证与离线测试记录见 ARCHITECTURE §7.2。
+        RouteMode::LibraryDefault => {}
+        RouteMode::ManualLocalProxy => {
+            let raw = params.manual_proxy_url.as_deref().unwrap_or_default();
+            let validated = crate::security::validation::validate_manual_proxy_url(raw)?;
+            let proxy = reqwest::Proxy::all(&validated.normalized)
+                .map_err(|error| format!("代理配置构建失败：{error}"))?;
+            builder = builder.proxy(proxy);
+        }
+    }
+    builder
+        .build()
+        .map_err(|error| format!("HTTP 客户端构建失败：{error}"))
+}
+
+/// manual_local_proxy 模式下的传输错误归类（D-005）：
+/// 代理连接被拒/无法建立 → `proxy_unavailable`（绝不回落，也不会标成直连失败）；
+/// TLS（经可用代理隧道）与超时保持原语义；无法归因如实 `unknown`。
+fn classify_transport_for_mode(
+    route_mode: RouteMode,
+    error: &reqwest::Error,
+) -> (ErrorKind, String) {
+    let (kind, detail) = classify_transport_error(error);
+    if route_mode == RouteMode::ManualLocalProxy {
+        // 代理要求认证（CONNECT 隧道被 407 拒绝）：reqwest 以连接错误呈现，
+        // 错误链含 "proxy authorization required" —— 归入 proxy_unavailable（D-005）。
+        let detail_lower = detail.to_lowercase();
+        if detail_lower.contains("proxy authorization required")
+            || detail_lower.contains("tunnel error")
+            || detail_lower.contains("connecting to socks proxy")
+            || detail_lower.contains("socks error")
+        {
+            return (
+                ErrorKind::ProxyUnavailable,
+                format!("指定的本地代理要求认证或拒绝隧道（未回落直连）｜{detail}"),
+            );
+        }
+        match kind {
+            ErrorKind::TcpFailure | ErrorKind::DnsFailure => {
+                return (
+                    ErrorKind::ProxyUnavailable,
+                    format!("指定的本地代理不可用（未回落直连）｜{detail}"),
+                );
+            }
+            ErrorKind::TlsFailure | ErrorKind::Unknown => {
+                // 经代理隧道后的失败：代理本身已可达，保留原语义并注明路径。
+                return (kind, format!("经指定代理的请求失败｜{detail}"));
+            }
+            ErrorKind::Timeout
+            | ErrorKind::Cancelled
+            | ErrorKind::Internal
+            | ErrorKind::InvalidInput
+            | ErrorKind::ProxyUnavailable => return (kind, detail),
+        }
+    }
+    (kind, detail)
+}
+
+/// 执行一次 HTTPS 测量。
+pub async fn probe_https(params: &HttpsProbeParams, cancel: CancellationToken) -> ProbeSample {
+    let attempt_no = 1;
+    if params.route_mode == RouteMode::ManualLocalProxy {
+        // 命令层已校验；此处防御性复核（D-005：仅 loopback、无凭证）。
+        let raw = params.manual_proxy_url.as_deref().unwrap_or_default();
+        if let Err(problem) = crate::security::validation::validate_manual_proxy_url(raw) {
+            return error_sample(
+                &params.target_id,
+                params.route_mode,
+                attempt_no,
+                ErrorKind::InvalidInput,
+                format!("手动代理地址不合法：{problem}"),
+                None,
+            );
+        }
+    }
+
+    let client = match build_client(params) {
         Ok(client) => client,
         Err(error) => {
             return error_sample(
                 &params.target_id,
                 params.route_mode,
                 attempt_no,
-                ErrorKind::Internal,
-                format!("HTTP 客户端构建失败：{error}"),
+                ErrorKind::InvalidInput,
+                error.to_string(),
                 None,
             );
         }
@@ -223,7 +305,7 @@ pub async fn probe_https(params: &HttpsProbeParams, cancel: CancellationToken) -
         match head {
             Ok(response) => response,
             Err(error) => {
-                let (kind, detail) = classify_transport_error(&error);
+                let (kind, detail) = classify_transport_for_mode(params.route_mode, &error);
                 return error_sample(
                     &params.target_id,
                     params.route_mode,
@@ -248,7 +330,7 @@ pub async fn probe_https(params: &HttpsProbeParams, cancel: CancellationToken) -
         match get {
             Ok(response) => response,
             Err(error) => {
-                let (kind, detail) = classify_transport_error(&error);
+                let (kind, detail) = classify_transport_for_mode(params.route_mode, &error);
                 return error_sample(
                     &params.target_id,
                     params.route_mode,
@@ -285,11 +367,8 @@ pub async fn probe_https(params: &HttpsProbeParams, cancel: CancellationToken) -
 
     let status = response.status().as_u16();
     let (success, outcome) = classify_status(status);
-    let duration_ms = if success {
-        Some(started.elapsed().as_millis() as u64)
-    } else {
-        None
-    };
+    // D-017：收到响应即完成请求，非 2xx 同样保留真实耗时。
+    let duration_ms = Some(started.elapsed().as_millis() as u64);
 
     // used_get_fallback 目前仅约束行为本身（回退一次、读体有上限）；
     // 其信息随 Phase 4 规则引擎需要时再进入契约字段，避免现在膨胀。
