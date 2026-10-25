@@ -76,7 +76,26 @@ npm run tauri build  # 发布构建（Phase 6 验证）
 - [docs/TEST_PLAN.md](docs/TEST_PLAN.md) — 测试策略与验收矩阵
 - [docs/DECISIONS.md](docs/DECISIONS.md) — 技术决策（ADR，D-001..D-013）与风险登记
 - [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) — 开发环境核查表
+- [docs/INSTALL.md](docs/INSTALL.md) — 安装说明（WebView2/数据位置/升级）
+- [CHANGELOG.md](CHANGELOG.md) — 更新日志
 - [ZCODE_PROMPTS.md](ZCODE_PROMPTS.md) — 分阶段开发提示词（工作流备忘）
+
+## 安装（Windows）
+
+从 [Releases](https://github.com/159357xxj/ai-dev-cockpit/releases) 下载 NSIS 安装包
+（核对 SHA-256 后安装，无需管理员权限），详见 [docs/INSTALL.md](docs/INSTALL.md)。
+卸载不会删除本地历史数据库（`%APPDATA%\com.aidevcockpit.app\history.db`）。
+
+## 隐私声明
+
+AI Dev Cockpit 是**本地优先**的只读诊断工具：
+
+- **不联网上传**：所有数据（诊断记录、历史、报告）仅保存在本机；导出经系统原生"另存为"完成，无任何网络上传。
+- **不采集凭证**：不读取/存储 Cookie、API Key、OAuth 令牌、代理订阅、SSH 私钥；诊断请求从不携带用户凭证。
+- **不遥测**：无崩溃上报、无使用统计、无账号体系。
+- **只读诊断**：不修改系统代理/DNS/路由/防火墙/注册表；不请求管理员权限；不做端口扫描或抓包。
+- **数据保留**：本地历史默认保留 30 天或 500 次（可配置）；卸载应用不自动删除该数据。
+- 完整边界见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §9 与 [AGENTS.md](AGENTS.md)。
 
 ## 隐私与安全边界（摘要）
 
@@ -86,3 +105,5 @@ npm run tauri build  # 发布构建（Phase 6 验证）
 4. 代理快照为只读本地检测，配置存在 ≠ 真实请求使用该配置；不下载/不执行 PAC。
 4. 导出报告先本地脱敏并预览确认；认证材料与敏感路径永不出现在报告中。
 5. 不做端口扫描、抓包、提权或系统设置修改。
+6. 导出使用系统原生"另存为"对话框，路径选择在本地完成，无任何网络上传。
+7. 正式（release）构建强制关闭演示模式；应用启动与运行过程零后台联网。

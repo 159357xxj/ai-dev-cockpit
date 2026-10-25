@@ -20,6 +20,9 @@ export interface AppSettings {
 const STORAGE_KEY = 'adc.settings.v1';
 const DEFAULT_SETTINGS: AppSettings = { theme: 'dark', demoMode: false };
 
+/** Demo 仅在开发构建可用；正式构建强制关闭且不可开启（D-009 / Phase 6 加固）。 */
+export const DEMO_AVAILABLE: boolean = import.meta.env.DEV;
+
 function loadSettings(): AppSettings {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
@@ -31,7 +34,8 @@ function loadSettings(): AppSettings {
       record.theme === 'dark' || record.theme === 'light' || record.theme === 'system'
         ? record.theme
         : DEFAULT_SETTINGS.theme;
-    const demoMode = record.demoMode === true;
+    // 正式构建忽略持久化的 demoMode（即使开发期残留也会被硬关）。
+    const demoMode = DEMO_AVAILABLE && record.demoMode === true;
     return { theme, demoMode };
   } catch {
     return DEFAULT_SETTINGS;
@@ -80,6 +84,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     setSettings((previous) => ({ ...previous, theme }));
   }, []);
   const setDemoMode = useCallback((demoMode: boolean) => {
+    if (!DEMO_AVAILABLE) return;
     setSettings((previous) => ({ ...previous, demoMode }));
   }, []);
 

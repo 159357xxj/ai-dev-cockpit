@@ -31,6 +31,11 @@ rusqlite = { version = "0.41.0", features = ["bundled"] }
 
 # Phase 3：Windows 只读代理配置 API（WinINet 用户配置 + WinHTTP 默认配置）。
 # windows-sys 已存在于依赖树（tauri 传递依赖），此处仅显式启用所需特性。
+# Phase 6：导出使用系统原生"另存为"对话框（路径选择在 Rust 侧完成，
+# 前端不传路径，收窄文件写入信任边界）。
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+rfd = "0.15"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

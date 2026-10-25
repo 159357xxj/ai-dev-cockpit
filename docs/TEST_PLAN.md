@@ -124,6 +124,23 @@ Phase 4 正式关闭。
 - [x] 桌面重启后历史保留复验：**已通过（2026-10-25 用户验收，四项全 PASS）**——
   完整重启后历史保留；取消任务的状态与样本正确；报告可预览/导出/正常打开；趋势与删除正常。
   **Phase 5 正式关闭。**
+### Phase 6（发布）—— 进行中（2026-10-25）
+
+**安全审计记录（2026-10-25）**：
+
+| 审计项 | 结论 |
+|---|---|
+| Tauri capability | 仅 `core:default`（主窗口）；无 shell/fs/http 等扩展权限；dialog 未引入插件 |
+| IPC 面 | 14 个白名单命令，全部 `rename_all="snake_case"`；入参在 Rust 侧二次校验（目标白名单/次数/超时/代理 loopback/设置键白名单/16 运行上限） |
+| CSP | `default-src 'self'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'`——无远程源；style unsafe-inline 为图表内联样式所需 |
+| 网络目标白名单 | `targets.rs` 6 个预设 https 域名，生产装配仅此来源；重定向规则锁定白名单主机+https+443；`no_proxy()` 显式；手动代理仅 loopback |
+| 重试 | `.retry(never())` 显式禁用 reqwest 默认 h2/h3 NACK 重发（D-018） |
+| SQLite | 全参数化；user_version 迁移只向前；事务写入；重复保存幂等（INSERT OR REPLACE + 样本重置）；D-014 取消口径 |
+| 脱敏 | sanitize_text：userinfo/敏感查询参数/本地用户路径/Authorization；遮蔽循环位置推进（死循环缺陷已在 P5 修复并有测试）；嵌套字段仅 error.summary/detail（规则引擎输出为固定文案，攻击面有限） |
+| Demo | 默认 false；**release 构建硬关**（DEMO_AVAILABLE=import.meta.env.DEV，设置页隐藏） |
+| 自动联网 | 无：启动仅本地读取（代理快照/SQLite），网络请求仅由用户点击触发 |
+| 凭证 | 不读取/存储/上传任何 Cookie/令牌/密钥；settings 表仅白名单键 |
+
 ### Phase 6（发布）
 - [ ] 执行并记录 AGENTS.md 验证基线全部命令；未执行的逐项写明原因。
 - [ ] 断网安装启动（PRD §8.1）；NSIS 安装/卸载/启动/历史数据位置检查。

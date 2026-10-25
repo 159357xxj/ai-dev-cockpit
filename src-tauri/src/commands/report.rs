@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State};
+use tauri::State;
 
 use crate::AppState;
 use crate::diagnostic::rules::{Diagnosis, diagnose};
@@ -155,29 +155,34 @@ pub fn preview_sanitized_report(
     })
 }
 
-/// 导出脱敏报告到应用数据目录的 exports/ 子目录（本地文件，无上传）。
+/// 导出脱敏报告：弹出系统原生"另存为"对话框（Rust 侧，前端不传路径——
+/// 文件写入信任边界收窄为对话框结果；用户取消返回 cancelled）。
+/// 写入内容为完整脱敏文本；无任何网络上传。
 #[tauri::command(rename_all = "snake_case")]
 pub fn export_sanitized_report(
     run_id: String,
     format: ReportFormat,
-    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ExportResult, IpcError> {
     let run = storage(&state)?.get_run(&run_id)?;
     let (content, filename) = build_report(&run, format);
 
-    let exports_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| IpcError::new(IpcErrorCode::Internal, format!("数据目录不可用：{error}")))?
-        .join("exports");
-    std::fs::create_dir_all(&exports_dir).map_err(|error| {
-        IpcError::new(IpcErrorCode::Internal, format!("创建导出目录失败：{error}"))
-    })?;
-    let path = exports_dir.join(&filename);
-    let size_bytes = content.len() as u64;
-    std::fs::write(&path, content)
+    let extension = match format {
+        ReportFormat::Json => "json",
+        ReportFormat::Markdown => "md",
+    };
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("导出脱敏诊断报告")
+        .set_file_name(&filename)
+        .add_filter("诊断报告", &[extension])
+        .save_file()
+    else {
+        return Err(IpcError::new(IpcErrorCode::Cancelled, "已取消导出"));
+    };
+
+    std::fs::write(&path, &content)
         .map_err(|error| IpcError::new(IpcErrorCode::Internal, format!("写入文件失败：{error}")))?;
+    let size_bytes = content.len() as u64;
 
     Ok(ExportResult {
         run_id,
