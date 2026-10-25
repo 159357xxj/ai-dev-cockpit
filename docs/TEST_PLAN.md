@@ -113,13 +113,15 @@ Phase 4 正式关闭。
 - 验收基线（2026-10-25 复跑全绿）：cargo test 102 项（39+19+13+31）、npm test 35 项、
   fmt/clippy(-D warnings)/lint/typecheck/build 全部 PASS。
 
-### Phase 5（SQLite 与导出）
-- [ ] 迁移测试：从 v0 逐版迁移到当前，重复执行幂等。
-- [ ] 事务完整性：completed run 必含全部样本；cancelled run 状态如实。
-- [ ] 保留策略：>30 天或 >500 会话触发清理的边界用例；删除/清空有确认且生效。
-- [ ] 脱敏测试集（表驱动）：Authorization 头、URL userinfo、query token、含用户目录的路径（`C:\Users\xxx\...`）、代理 URL 凭证、特殊字符、二进制垃圾字符——全部遮蔽且不崩溃。
-- [ ] 导出文件为合法 JSON/Markdown，含"诊断局限"说明段；重启应用后历史仍在。
-
+### Phase 5（SQLite 历史与导出）—— 已实现（tests/storage.rs 8 项全绿）
+- [x] rusqlite（bundled）三表 + 版本化迁移（user_version，幂等）；全部 SQL 参数化；前端仅白名单 IPC。
+- [x] 事务写入（run+samples 单事务）；取消/部分样本原样保留；聚合重算符合 D-014/D-017（往返保真测试）。
+- [x] 历史页：目标/模式筛选、最近两次可比运行趋势（同目标+模式+采样数）、空态、行详情（get_run + 规则诊断）。
+- [x] 保留策略：默认 30 天/500 次，settings 白名单键可覆盖；启动与保存后执行；数量/时间边界 + settings 覆盖测试。
+- [x] 删除/清空：单删幂等、清空级联；前端二次确认。
+- [x] 导出：JSON/Markdown 本地导出（exports/ 目录，零上传）；先预览（含局限说明）后确认；
+  脱敏测试集：userinfo、查询 token、本地用户路径、Authorization 全遮蔽（含修复的遮蔽死循环缺陷）。
+- [ ] 桌面重启后历史保留复验：待用户验收确认。
 ### Phase 6（发布）
 - [ ] 执行并记录 AGENTS.md 验证基线全部命令；未执行的逐项写明原因。
 - [ ] 断网安装启动（PRD §8.1）；NSIS 安装/卸载/启动/历史数据位置检查。

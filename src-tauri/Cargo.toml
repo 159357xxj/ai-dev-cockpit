@@ -27,6 +27,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 reqwest = { version = "0.12", features = ["socks"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rusqlite = { version = "0.41.0", features = ["bundled"] }
 
 # Phase 3：Windows 只读代理配置 API（WinINet 用户配置 + WinHTTP 默认配置）。
 # windows-sys 已存在于依赖树（tauri 传递依赖），此处仅显式启用所需特性。

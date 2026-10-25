@@ -16,7 +16,12 @@ import type {
   JobHandle,
   DiagnosticRun,
   Diagnosis,
+  ExportResult,
   ProgressPayload,
+  ReportFormat,
+  ReportPreview,
+  RunQuery,
+  RunSummary,
   SystemSnapshot,
 } from './types';
 
@@ -70,6 +75,24 @@ export const api = {
   /** 规则诊断（Phase 4：纯函数、离线、确定性；输入为已持有的运行结果）。 */
   diagnoseRuns: (runs: DiagnosticRun[]): Promise<Diagnosis[]> =>
     callIpc<Diagnosis[]>('diagnose_runs', { runs }),
+
+  /** 历史（Phase 5）：列表 / 详情 / 删除 / 清空 / 设置（白名单键）。 */
+  listRuns: (query: RunQuery): Promise<RunSummary[]> =>
+    callIpc<RunSummary[]>('list_runs', { query }),
+  getRun: (runId: string): Promise<DiagnosticRun> =>
+    callIpc<DiagnosticRun>('get_run', { run_id: runId }),
+  deleteRun: (runId: string): Promise<boolean> =>
+    callIpc<boolean>('delete_run', { run_id: runId }),
+  clearHistory: (): Promise<number> => callIpc<number>('clear_history', {}),
+  getSetting: (key: string): Promise<string | null> =>
+    callIpc<string | null>('get_setting', { key }),
+  setSetting: (key: string, valueJson: string): Promise<void> =>
+    callIpc<void>('set_setting', { key, value_json: valueJson }),
+  /** 脱敏报告：先预览（不落盘），确认后导出到应用数据目录 exports/。 */
+  previewSanitizedReport: (runId: string, format: ReportFormat): Promise<ReportPreview> =>
+    callIpc<ReportPreview>('preview_sanitized_report', { run_id: runId, format }),
+  exportSanitizedReport: (runId: string, format: ReportFormat): Promise<ExportResult> =>
+    callIpc<ExportResult>('export_sanitized_report', { run_id: runId, format }),
 
   /** 启动诊断（低层句柄：一般应使用 runDiagnostic 以获得事件流）。 */
   startDiagnostic: (request: DiagnosticRequest): Promise<JobHandle> =>

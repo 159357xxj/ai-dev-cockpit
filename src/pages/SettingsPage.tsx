@@ -1,13 +1,17 @@
 import { ShieldCheck } from 'lucide-react';
+import { useEffect, useState } from 'react';
 
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
+import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { useAppSettings, type ThemeSetting } from '@/app/settings';
+import { api } from '@/lib/api';
 
 const THEME_OPTIONS: Array<{ value: ThemeSetting; label: string }> = [
   { value: 'dark', label: '深色（默认）' },
@@ -96,13 +100,7 @@ export function SettingsPage() {
             <CardDescription>随对应阶段开放</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3 text-sm">
-            <div className="flex items-center justify-between gap-4">
-              <div>
-                <p>历史数据保留策略</p>
-                <p className="text-xs text-muted-foreground">默认 30 天或 500 次会话，可配置</p>
-              </div>
-              <Badge variant="secondary">Phase 5 开放</Badge>
-            </div>
+            <RetentionSettings />
             <Separator />
             <div className="flex items-center justify-between gap-4">
               <div>
@@ -130,6 +128,90 @@ export function SettingsPage() {
           </CardContent>
         </Card>
       </div>
+    </div>
+  );
+}
+
+/** 历史保留策略（Phase 5：写入 settings 表，白名单键）。 */
+function RetentionSettings() {
+  const [maxRuns, setMaxRuns] = useState('500');
+  const [maxAgeDays, setMaxAgeDays] = useState('30');
+  const [saved, setSaved] = useState(false);
+  const [available, setAvailable] = useState(true);
+
+  useEffect(() => {
+    api
+      .getSetting('retention.max_runs')
+      .then((value) => {
+        if (value) setMaxRuns(String(JSON.parse(value)));
+        return api.getSetting('retention.max_age_days');
+      })
+      .then((value) => {
+        if (value) setMaxAgeDays(String(JSON.parse(value)));
+      })
+      .catch(() => setAvailable(false));
+  }, []);
+
+  const save = (): void => {
+    const runs = Math.max(1, Math.min(5000, Number(maxRuns) || 500));
+    const days = Math.max(1, Math.min(3650, Number(maxAgeDays) || 30));
+    Promise.all([
+      api.setSetting('retention.max_runs', String(runs)),
+      api.setSetting('retention.max_age_days', String(days)),
+    ])
+      .then(() => {
+        setSaved(true);
+        setMaxRuns(String(runs));
+        setMaxAgeDays(String(days));
+      })
+      .catch(() => setAvailable(false));
+  };
+
+  if (!available) {
+    return (
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <p>历史数据保留策略</p>
+          <p className="text-xs text-muted-foreground">默认 30 天或 500 次会话</p>
+        </div>
+        <Badge variant="secondary">存储不可用</Badge>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-4">
+        <p>历史数据保留策略</p>
+        <div className="flex items-center gap-2">
+          <Input
+            aria-label="保留运行数上限"
+            className="h-8 w-24"
+            type="number"
+            min={1}
+            max={5000}
+            value={maxRuns}
+            onChange={(event) => setMaxRuns(event.target.value)}
+          />
+          <span className="text-xs text-muted-foreground">次 /</span>
+          <Input
+            aria-label="保留天数"
+            className="h-8 w-24"
+            type="number"
+            min={1}
+            max={3650}
+            value={maxAgeDays}
+            onChange={(event) => setMaxAgeDays(event.target.value)}
+          />
+          <span className="text-xs text-muted-foreground">天</span>
+          <Button size="sm" variant="outline" onClick={save}>
+            保存
+          </Button>
+        </div>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        超过任一上限时自动清理最旧的运行（下次启动与每次保存后生效）。{saved ? '已保存。' : ''}
+      </p>
     </div>
   );
 }

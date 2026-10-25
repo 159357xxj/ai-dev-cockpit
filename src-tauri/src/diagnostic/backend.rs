@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use super::scheduler::{Emitter, JobSpec, execute_job};
-use super::types::{CancelOutcome, DiagnosticRequest, IpcError, IpcErrorCode, JobHandle};
+use super::types::{
+    CancelOutcome, DiagnosticRequest, DiagnosticRun, IpcError, IpcErrorCode, JobHandle,
+};
 
 /// 事件出口容器：生产实现把 JobEvent 映射为 Tauri 事件；测试捕获到内存。
 pub struct JobContext {
@@ -35,10 +37,15 @@ pub trait ProbeBackend: std::fmt::Debug + Send + Sync {
 /// `spec_builder` 默认用 [`JobSpec::production`]（白名单端点）；
 /// 测试通过 [`ProductionBackend::with_spec_builder`] 注入指向本地 mock 的端点，
 /// 从而在不联网的前提下走完整的任务/事件/取消路径。
+type SpecBuilder = Arc<dyn Fn(String, DiagnosticRequest, String) -> JobSpec + Send + Sync>;
+type RunCompleteHook = Arc<dyn Fn(&DiagnosticRun) + Send + Sync>;
+
 pub struct ProductionBackend {
     app_version: String,
     jobs: Mutex<HashMap<String, JobEntry>>,
-    spec_builder: Arc<dyn Fn(String, DiagnosticRequest, String) -> JobSpec + Send + Sync>,
+    spec_builder: SpecBuilder,
+    /// 运行结束钩子（Phase 5：SQLite 持久化）。测试与桩后端保持 None。
+    on_run_complete: Option<RunCompleteHook>,
 }
 
 impl std::fmt::Debug for ProductionBackend {
@@ -62,15 +69,19 @@ impl ProductionBackend {
         Self::with_spec_builder(app_version, Arc::new(JobSpec::production))
     }
 
-    pub fn with_spec_builder(
-        app_version: String,
-        spec_builder: Arc<dyn Fn(String, DiagnosticRequest, String) -> JobSpec + Send + Sync>,
-    ) -> Self {
+    pub fn with_spec_builder(app_version: String, spec_builder: SpecBuilder) -> Self {
         Self {
             app_version,
             jobs: Mutex::new(HashMap::new()),
             spec_builder,
+            on_run_complete: None,
         }
+    }
+
+    /// 注入运行结束钩子（持久化；返回 self 便于组装）。
+    pub fn with_on_run_complete(mut self, hook: Arc<dyn Fn(&DiagnosticRun) + Send + Sync>) -> Self {
+        self.on_run_complete = Some(hook);
+        self
     }
 }
 
@@ -114,9 +125,13 @@ impl ProbeBackend for ProductionBackend {
         let spec = (self.spec_builder)(job_id.clone(), request, self.app_version.clone());
         let emit = ctx.emit;
         let done_flag = done.clone();
+        let on_complete = self.on_run_complete.clone();
         tokio::task::spawn(async move {
-            let _run = execute_job(spec, cancel, emit).await;
+            let run = execute_job(spec, cancel, emit).await;
             done_flag.store(true, Ordering::Relaxed);
+            if let Some(persist) = on_complete {
+                persist(&run);
+            }
         });
 
         Ok(JobHandle { job_id })

@@ -147,5 +147,10 @@
   全基线复跑通过（cargo 102 / npm 35 / 八命令）。引擎层对多运行同目标的逐运行规则仍可能
   产生同 rule_id 重复条目（由前端 sortAndDedup 去重展示），引擎级合并留待后续迭代。
 
+## D-022 SQLite 持久化与脱敏导出（Phase 5，2026-10-25）
+- 决定：rusqlite bundled；runs/results/settings 三表 + user_version 版本化迁移（只向前、幂等）；全 SQL 参数化；新增 8 个白名单 IPC 命令；运行结束经 `on_run_complete` 钩子事务写入（注入面收敛于 lib.rs，D-012 延续）；保留策略默认 30 天/500 次、settings 白名单键覆盖、启动与保存后执行；导出先预览（含局限说明）后写应用数据目录 exports/（零上传）；`sanitize_text` 遮蔽 userinfo/敏感查询参数/本地用户路径/Authorization 头。
+- 修复缺陷：遮蔽循环同一匹配点无限重复（位置推进修复，storage 测试复现）；rusqlite 无 u64（i64 转换）。
+- 后果：Rust 110 项全绿（新增 storage 8 项）；存储不可用时其余功能不受影响（命令返回 internal）。
+
 ## 变更流程
 新决策追加新编号条目（如 D-011）；推翻旧决策时新条目标注"替代 D-xxx"，旧条目状态改为"已替代（见 D-xxx）"。

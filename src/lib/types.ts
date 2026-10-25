@@ -195,6 +195,45 @@ export interface Diagnosis {
   related_probe_types: ProbeType[];
 }
 
+/** 历史记录（Phase 5，Rust storage::RunSummary 一一对应）。 */
+export interface RunSummary {
+  run_id: string;
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  route_mode: string;
+  repeats: number;
+  app_version: string;
+  target_ids: string[];
+  sample_count: number;
+  success_count: number;
+  transport_failure_count: number;
+  https_median_ms: number | null;
+}
+
+export interface RunQuery {
+  target_id?: string | null;
+  route_mode?: RouteMode | null;
+  limit?: number | null;
+}
+
+export type ReportFormat = 'json' | 'markdown';
+
+export interface ReportPreview {
+  run_id: string;
+  format: ReportFormat;
+  content: string;
+  filename: string;
+  note: string;
+}
+
+export interface ExportResult {
+  run_id: string;
+  format: ReportFormat;
+  path: string;
+  size_bytes: number;
+}
+
 export interface AdapterSummary {
   name: string;
   adapter_type: string | null;

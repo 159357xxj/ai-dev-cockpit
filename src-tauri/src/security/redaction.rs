@@ -51,6 +51,94 @@ pub fn redact_proxy_value(raw: &str) -> String {
         .join(";")
 }
 
+/// 导出文本脱敏（Phase 5）：对样本错误文本、代理字符串等自由文本做保守遮蔽。
+/// 规则（顺序应用）：
+/// 1. URL userinfo：`scheme://user:pass@host` → `scheme://[凭证已隐藏]@host`；
+/// 2. 敏感查询参数：token/key/secret/password/apikey 的值 → `[已隐藏]`；
+/// 3. 本地用户路径：`C:\Users\<name>`、`/home/<name>`、`/Users/<name>` 前缀 → `[本地路径]`；
+/// 4. Authorization 头文本 → `[认证头已隐藏]`。
+pub fn sanitize_text(raw: &str) -> String {
+    let mut text = raw.to_string();
+
+    // 1. userinfo（保留 scheme 与 host）。
+    if let Some(at) = text.rfind('@') {
+        let head = &text[..at];
+        if let Some(scheme_end) = head.find("://") {
+            text = format!(
+                "{}{}{}",
+                &head[..scheme_end + 3],
+                "[凭证已隐藏]@",
+                &text[at + 1..]
+            );
+        }
+    }
+
+    // 2. 敏感查询参数（参数名出现在 ? 或 & 之后）。
+    for name in ["token", "key", "secret", "password", "apikey"] {
+        let mut guarded = text.clone();
+        for prefix in ['?', '&'] {
+            let pattern = format!("{prefix}{name}=");
+            // 位置推进式搜索：已遮蔽的值跳过，避免同一匹配点无限循环。
+            let mut search_from = 0usize;
+            while let Some(relative) = guarded[search_from..].find(&pattern) {
+                let value_start = search_from + relative + pattern.len();
+                if guarded[value_start..].starts_with("[已隐藏]") {
+                    search_from = value_start;
+                    continue;
+                }
+                let value_end = guarded[value_start..]
+                    .find(['&', '#', ' ', '"'])
+                    .map(|offset| value_start + offset)
+                    .unwrap_or(guarded.len());
+                guarded = format!(
+                    "{}{}{}",
+                    &guarded[..value_start],
+                    "[已隐藏]",
+                    &guarded[value_end..]
+                );
+                search_from = value_start;
+            }
+        }
+        text = guarded;
+    }
+
+    // 3. 本地用户路径（首个匹配即可满足脱敏要求）。
+    let windows_user_prefix = String::from_utf8_lossy(b"C:\\Users\\").to_string();
+    let unix_home_prefix = "/home/";
+    let mac_user_prefix = "/Users/";
+    for prefix in [
+        windows_user_prefix.as_str(),
+        unix_home_prefix,
+        mac_user_prefix,
+    ] {
+        if let Some(start) = text.find(prefix) {
+            let after = &text[start + prefix.len()..];
+            let end = after
+                .find(['/', ' ', '"', ':', '\\'])
+                .map(|offset| start + prefix.len() + offset)
+                .unwrap_or(text.len());
+            text = format!("{}[本地路径]{}", &text[..start], &text[end..]);
+        }
+    }
+
+    // 4. Authorization 头。
+    let lowered = text.to_lowercase();
+    if let Some(start) = lowered.find("authorization:") {
+        let value_start = start + "authorization:".len();
+        let value_end = text[value_start..]
+            .find(['\n', '\r'])
+            .map(|offset| value_start + offset)
+            .unwrap_or(text.len());
+        text = format!(
+            "{}[认证头已隐藏]{}",
+            &text[..value_start],
+            &text[value_end..]
+        );
+    }
+
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::redact_proxy_value;
