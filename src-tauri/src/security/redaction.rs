@@ -391,7 +391,9 @@ fn mask_all_user_paths(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0usize;
     let mut index = 0usize;
-    while index + 8 <= bytes.len() {
+    // `X:\users\` 需要 index..=index+8 共 9 字节；循环条件必须保证 index+8 可访问
+    // （原 `index + 8 <= len` 在 index+8 == len 时越界——"C:\Users" panic 根因）。
+    while index + 9 <= bytes.len() {
         // Windows：X:\users\（X 为任意 ASCII 字母；\u 大小写不敏感）。
         let is_win = bytes[index].is_ascii_alphabetic()
             && bytes[index + 1] == b':'

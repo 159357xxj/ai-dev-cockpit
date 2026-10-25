@@ -42,7 +42,13 @@ jobs:
       # windows-latest ships Git for Windows (with openssl); add it to PATH explicitly.
       - name: Locate openssl (TLS mock test dependency)
         shell: pwsh
-        run: Add-Content $env:GITHUB_PATH "C:\Program Files\Git\usr\bin"
+        run: |
+          Add-Content $env:GITHUB_PATH "C:\Program Files\Git\usr\bin"
+          if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
+            Write-Error "openssl.exe not found in PATH after adding Git usr\bin; TLS mock tests would fail cryptically. Check runner image."
+            exit 1
+          }
+          openssl version
       - run: cargo fmt --check
         working-directory: src-tauri
       - run: cargo clippy --all-targets -- -D warnings

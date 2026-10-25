@@ -52,11 +52,17 @@ impl Storage {
             .map_err(|error| format!("外键设置失败：{error}"))?;
         migrations::apply(&mut connection)?;
         // F-07：清理历史版本经 settings 表传递快照 id 的遗留键（一次性、幂等；
-        // 快照现已纯内存管理，不再写 settings）。
-        let _ = connection.execute(
+        // 快照现已纯内存管理，不再写 settings）。非关键维护：失败不阻断启动、
+        // 保留数据，但**必须可观测**（非敏感 stderr 警告——静默假成功不允许）。
+        // 语句级原子性由 SQLite 单条 DELETE 保证（V4 QA 触发器探针已验证回滚）。
+        if let Err(error) = connection.execute(
             "DELETE FROM settings WHERE key LIKE 'report.snapshot.%'",
             [],
-        );
+        ) {
+            eprintln!(
+                "[storage] 非关键维护失败：清理遗留快照键未执行（数据保留、启动继续）：{error}"
+            );
+        }
         Ok(Self {
             connection: Mutex::new(connection),
         })

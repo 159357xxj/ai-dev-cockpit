@@ -57,11 +57,11 @@ fn do_preview(store: &mut SnapshotStore, run: &DiagnosticRun) -> (String, String
         snapshot_id: snapshot_id.clone(),
         run_id: run.run_id.clone(),
         format: ReportFormat::Json,
-        content: content.clone(),
+        content: std::sync::Arc::from(content.as_str()),
         filename: filename.clone(),
         created_at: std::time::Instant::now(),
         state: SnapshotState::Available,
-    });
+    }).unwrap();
     (content, filename, snapshot_id)
 }
 
@@ -76,7 +76,8 @@ fn f07_new_snapshot_immediately_consumable_bytes_equal_preview() {
         .take(&snapshot_id, &run.run_id, ReportFormat::Json)
         .expect("新快照必须立即可消费");
     assert_eq!(
-        snapshot.content, preview_content,
+        &*snapshot.content,
+        preview_content.as_str(),
         "导出字节=预览字节（F-07）"
     );
     assert_eq!(snapshot.state, SnapshotState::InFlight);
@@ -90,20 +91,25 @@ fn f07_snapshot_survives_history_change() {
     let run = contaminated_run_for_snapshot();
     let (preview_content, _, snapshot_id) = do_preview(&mut store, &run);
 
-    // 历史数据"变化"（重新生成报告内容不同）——已确认的预览不受影响。
+    // 历史数据"变化"：修改**真正导出的结构化字段**（repeats → attempts_total
+    // 变化）——重生成报告确定性不同（不依赖 exported_at 毫秒差，无时间竞态）。
+    // （V4 QA：旧断言依赖已默认省略的 error.summary，必失败。）
     let mut changed = run.clone();
-    changed.targets[0].samples[0].error = Some(DiagnosticError {
-        kind: ErrorKind::Unknown,
-        summary: "QA_CHANGED_AFTER_PREVIEW".into(),
-        detail: None,
-    });
+    changed.repeats = 5;
     let (regenerated, _) = build_report(&changed, ReportFormat::Json);
-    assert_ne!(regenerated, preview_content, "前提：重生成内容不同");
+    assert_ne!(
+        regenerated, preview_content,
+        "前提：重生成内容不同（结构化字段）"
+    );
 
     let snapshot = store
         .take(&snapshot_id, &run.run_id, ReportFormat::Json)
         .expect("快照仍可消费");
-    assert_eq!(snapshot.content, preview_content, "F-07：导出=预览字节");
+    assert_eq!(
+        &*snapshot.content,
+        preview_content.as_str(),
+        "F-07：导出=预览字节"
+    );
     store.finish_success(&snapshot_id).unwrap();
 }
 
@@ -135,7 +141,7 @@ fn f07_invalid_wrong_run_wrong_format_rejected() {
     let snapshot = store
         .take(&snapshot_id, &run.run_id, ReportFormat::Json)
         .expect("正确关联应可消费");
-    assert_eq!(snapshot.content, content);
+    assert_eq!(&*snapshot.content, content.as_str());
     store.finish_success(&snapshot_id).unwrap();
 }
 
@@ -173,7 +179,7 @@ fn f07_cancel_allows_retry_same_bytes() {
     let snapshot = store
         .take(&snapshot_id, &run.run_id, ReportFormat::Json)
         .expect("取消后可重试");
-    assert_eq!(snapshot.content, preview_content);
+    assert_eq!(&*snapshot.content, preview_content.as_str());
     store.finish_success(&snapshot_id).unwrap();
 }
 
@@ -197,9 +203,13 @@ fn f07_write_failure_allows_retry_and_cleans_partial() {
     let snapshot2 = store
         .take(&snapshot_id, &run.run_id, ReportFormat::Json)
         .expect("失败后可重试");
-    assert_eq!(snapshot2.content, preview_content, "重试导出同一份字节");
+    assert_eq!(
+        &*snapshot2.content,
+        preview_content.as_str(),
+        "重试导出同一份字节"
+    );
     let good_path = std::env::temp_dir().join(format!("adc-f07-{}.md", snapshot_id));
-    std::fs::write(&good_path, &snapshot2.content).unwrap();
+    std::fs::write(&good_path, &*snapshot2.content).unwrap();
     let written = std::fs::read(&good_path).unwrap();
     assert_eq!(
         written,
@@ -246,11 +256,11 @@ fn f07_ttl_expiry_rejects_expired_snapshot() {
         snapshot_id: "snap-expired".to_string(),
         run_id: run.run_id.clone(),
         format: ReportFormat::Json,
-        content: "expired-content".into(),
+        content: std::sync::Arc::from("expired-content"),
         filename: "f.json".into(),
         created_at: std::time::Instant::now() - std::time::Duration::from_secs(660),
         state: SnapshotState::Available,
-    });
+    }).unwrap();
 
     let error = store
         .take("snap-expired", &run.run_id, ReportFormat::Json)
@@ -269,11 +279,11 @@ fn f07_count_limit_enforced() {
             snapshot_id: format!("snap-{index}"),
             run_id: run.run_id.clone(),
             format: ReportFormat::Json,
-            content,
+            content: std::sync::Arc::from(content.as_str()),
             filename,
             created_at: std::time::Instant::now(),
             state: SnapshotState::Available,
-        });
+        }).unwrap();
     }
     assert_eq!(store.available_count(), 8, "数量上限 8");
     assert!(
@@ -297,7 +307,7 @@ fn f07_saved_file_bytes_equal_preview_bytes() {
         .take(&snapshot_id, &run.run_id, ReportFormat::Json)
         .expect("take");
     let path = std::env::temp_dir().join(format!("adc-f07-bytes-{}.json", snapshot_id));
-    std::fs::write(&path, &snapshot.content).unwrap();
+    std::fs::write(&path, &*snapshot.content).unwrap();
     let saved = std::fs::read(&path).unwrap();
     assert_eq!(
         saved,
