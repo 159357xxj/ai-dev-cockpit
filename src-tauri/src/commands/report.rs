@@ -26,6 +26,8 @@ pub struct ReportPreview {
     pub content: String,
     pub filename: String,
     pub note: String,
+    /// 不透明快照 id：导出命令凭此复用同一份脱敏字节（F-07）。
+    pub snapshot_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +60,16 @@ fn sanitize_and_cap(text: &str) -> String {
     }
 }
 
+/// target_id 白名单校验（fail-closed）：非预设目标的合成/污染 ID 遮蔽为
+/// [未知目标]——报告标识字段不依赖 renderer 的文本规则。
+fn safe_target_id(target_id: &str) -> String {
+    if crate::diagnostic::targets::find_target(target_id).is_some() {
+        target_id.to_string()
+    } else {
+        "[未知目标]".to_string()
+    }
+}
+
 fn secure_run_json(run: &DiagnosticRun) -> serde_json::Value {
     serde_json::json!({
         "run_id": run.run_id,
@@ -68,7 +80,7 @@ fn secure_run_json(run: &DiagnosticRun) -> serde_json::Value {
         "repeats": run.repeats,
         "app_version": run.app_version,
         "targets": run.targets.iter().map(|target| serde_json::json!({
-            "target_id": target.target_id,
+            "target_id": safe_target_id(&target.target_id),
             "aggregates": target.aggregates.iter().map(|aggregate| serde_json::json!({
                 "probe_type": aggregate.probe_type,
                 "attempts_total": aggregate.attempts_total,
@@ -90,8 +102,9 @@ fn secure_run_json(run: &DiagnosticRun) -> serde_json::Value {
                 "http_status": sample.http_status,
                 "http_outcome": sample.http_outcome,
                 "error_kind": sample.error.as_ref().map(|error| error.kind),
-                "error_summary": sample.error.as_ref().map(|error| sanitize_and_cap(&error.summary)),
-                "error_detail": sample.error.as_ref().and_then(|error| error.detail.as_deref().map(sanitize_and_cap)),
+                // F-02 V3 契约收敛：原始 error.summary/detail **默认不导出**
+                // （不可靠净化的自由文本 fail-closed 省略；错误语义由 error_kind
+                // 枚举完整承载）。
                 "tested_at": sample.tested_at,
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
@@ -112,7 +125,7 @@ fn secure_diagnoses_json(diagnoses: &[Diagnosis]) -> serde_json::Value {
                 "possible_causes": diagnosis.possible_causes.iter().map(|cause| sanitize_and_cap(cause)).collect::<Vec<_>>(),
                 "verification_steps": diagnosis.verification_steps.iter().map(|step| sanitize_and_cap(step)).collect::<Vec<_>>(),
                 "limitations": diagnosis.limitations.iter().map(|limit| sanitize_and_cap(limit)).collect::<Vec<_>>(),
-                "related_target_ids": diagnosis.related_target_ids,
+                "related_target_ids": diagnosis.related_target_ids.iter().map(|id| safe_target_id(id)).collect::<Vec<_>>(),
                 "related_probe_types": diagnosis.related_probe_types,
             })
         })
@@ -204,9 +217,19 @@ fn storage<'a>(state: &'a State<'_, AppState>) -> Result<&'a Storage, IpcError> 
         .ok_or_else(|| IpcError::new(IpcErrorCode::Internal, "历史存储不可用"))
 }
 
+/// 快照状态机（F-07）：Available →（take）→ InFlight →（成功）→ Consumed /
+/// （取消或写盘失败）→ Available（可重试）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotState {
+    Available,
+    InFlight,
+    Consumed,
+}
+
 /// 服务端不可变报告快照（F-07）：预览与导出复用**同一份脱敏字节**。
 /// 只保存已脱敏内容（绝不缓存未脱敏数据）；id 为 UUID v4（不可预测）；
-/// 有有效期；导出后即失效（单次使用）；数量与总字节有上限。
+/// created_at 用单调时钟 Instant（TTL 判断与创建同基准）。
+#[derive(Debug, Clone)]
 pub struct ReportSnapshot {
     pub snapshot_id: String,
     pub run_id: String,
@@ -214,78 +237,133 @@ pub struct ReportSnapshot {
     pub content: String,
     pub filename: String,
     pub created_at: std::time::Instant,
-    pub exported: bool,
+    pub state: SnapshotState,
 }
 
-const SNAPSHOT_TTL_SECS: u64 = 600;
+const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 const SNAPSHOT_MAX_COUNT: usize = 8;
 const SNAPSHOT_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
-/// 快照管理状态（Mutex 内完成淘汰/插入/取出，用户取消不会破坏状态）。
+/// 快照管理状态（Mutex 内完成淘汰/插入/取出/状态迁移，用户取消不会破坏状态）。
 #[derive(Default)]
 pub struct SnapshotStore {
-    pub snapshots: std::collections::VecDeque<ReportSnapshot>,
+    available: std::collections::VecDeque<ReportSnapshot>,
+    in_flight: Vec<ReportSnapshot>,
+    consumed_count: usize,
 }
 
 impl SnapshotStore {
-    /// 淘汰过期/超限快照，然后插入新快照。
-    pub fn insert(&mut self, snapshot: ReportSnapshot) {
-        let now = now_secs();
-        self.snapshots.retain(|item| {
-            now.saturating_sub(now_secs_since_instant(item.created_at)) < SNAPSHOT_TTL_SECS
-        });
-        while self.snapshots.len() >= SNAPSHOT_MAX_COUNT {
-            self.snapshots.pop_front();
-        }
-        while self.total_bytes() + snapshot.content.len() > SNAPSHOT_MAX_TOTAL_BYTES {
-            if self.snapshots.is_empty() {
-                break; // 单个超大快照也允许（不超过总字节上限时才插入）。
-            }
-            self.snapshots.pop_front();
-        }
-        if snapshot.content.len() <= SNAPSHOT_MAX_TOTAL_BYTES {
-            self.snapshots.push_back(snapshot);
-        }
+    fn total_available_bytes(&self) -> usize {
+        self.available.iter().map(|item| item.content.len()).sum()
     }
 
-    fn total_bytes(&self) -> usize {
-        self.snapshots.iter().map(|item| item.content.len()).sum()
+    /// 淘汰过期 Available（created_at.elapsed() > TTL，单调时钟）。
+    fn evict_expired(&mut self) {
+        self.available
+            .retain(|item| item.created_at.elapsed() < SNAPSHOT_TTL);
     }
 
-    /// 取出快照（单次使用：取出即从队列移除，防重复导出/状态混淆）。
+    /// 插入新快照（Available）；先淘汰过期/超限的旧 Available。
+    /// InFlight 不参与淘汰（生命周期短暂）。
+    pub fn insert(&mut self, mut snapshot: ReportSnapshot) {
+        self.evict_expired();
+        snapshot.state = SnapshotState::Available;
+        while self.available.len() >= SNAPSHOT_MAX_COUNT {
+            self.available.pop_front();
+        }
+        while self.total_available_bytes() + snapshot.content.len() > SNAPSHOT_MAX_TOTAL_BYTES
+            && !self.available.is_empty()
+        {
+            self.available.pop_front();
+        }
+        self.available.push_back(snapshot);
+    }
+
+    /// 预占快照（take）：Available → InFlight。返回快照内容副本。
+    /// 并发/重复消费：InFlight 不再匹配，第二次 take 返回错误。
     pub fn take(
         &mut self,
         snapshot_id: &str,
         run_id: &str,
         format: ReportFormat,
     ) -> Result<ReportSnapshot, IpcError> {
-        let now = now_secs();
-        let position = self.snapshots.iter().position(|item| {
-            item.run_id == run_id
-                && item.format == format
-                && item.snapshot_id == snapshot_id
-                && !item.exported
-                && now.saturating_sub(now_secs_since_instant(item.created_at)) < SNAPSHOT_TTL_SECS
+        self.evict_expired();
+        let position = self.available.iter().position(|item| {
+            item.snapshot_id == snapshot_id && item.run_id == run_id && item.format == format
         });
-        match position {
-            Some(index) => Ok(self.snapshots.remove(index).expect("index 有效")),
-            None => Err(IpcError::new(
+        let Some(index) = position else {
+            return Err(IpcError::new(
                 IpcErrorCode::InvalidInput,
                 "报告快照不存在、已过期或已使用；请重新预览后再导出",
-            )),
-        }
+            ));
+        };
+        let Some(mut snapshot) = self.available.remove(index) else {
+            return Err(IpcError::new(IpcErrorCode::Internal, "快照状态不一致"));
+        };
+        snapshot.state = SnapshotState::InFlight;
+        self.in_flight.push(snapshot.clone());
+        Ok(snapshot)
     }
-}
 
-fn now_secs_since_instant(instant: std::time::Instant) -> u64 {
-    instant.elapsed().as_secs()
+    /// 用户取消另存为：InFlight → Available（同一份字节可重试导出）。
+    pub fn release(&mut self, snapshot_id: &str) -> Result<(), IpcError> {
+        if let Some(position) = self.in_flight.iter().position(|item| {
+            item.snapshot_id == snapshot_id && item.state == SnapshotState::InFlight
+        }) {
+            if position >= self.in_flight.len() {
+                return Err(IpcError::new(IpcErrorCode::Internal, "快照状态不一致"));
+            }
+            let mut snapshot = self.in_flight.swap_remove(position);
+            snapshot.state = SnapshotState::Available;
+            self.evict_expired();
+            self.available.push_back(snapshot);
+            return Ok(());
+        }
+        Err(IpcError::new(IpcErrorCode::InvalidInput, "快照不在进行中"))
+    }
+
+    /// 保存成功：InFlight → Consumed（内容丢弃，快照失效）。
+    pub fn finish_success(&mut self, snapshot_id: &str) -> Result<(), IpcError> {
+        if let Some(position) = self.in_flight.iter().position(|item| {
+            item.snapshot_id == snapshot_id && item.state == SnapshotState::InFlight
+        }) {
+            self.in_flight.remove(position);
+            self.consumed_count += 1;
+            return Ok(());
+        }
+        Err(IpcError::new(IpcErrorCode::InvalidInput, "快照不在进行中"))
+    }
+
+    /// 写盘失败：InFlight → Available（可重试）；partial_path 存在时清理部分文件。
+    pub fn finish_failure(
+        &mut self,
+        snapshot_id: &str,
+        partial_path: Option<&std::path::Path>,
+    ) -> Result<(), IpcError> {
+        if let Some(position) = self.in_flight.iter().position(|item| {
+            item.snapshot_id == snapshot_id && item.state == SnapshotState::InFlight
+        }) {
+            if position >= self.in_flight.len() {
+                return Err(IpcError::new(IpcErrorCode::Internal, "快照状态不一致"));
+            }
+            let snapshot = self.in_flight.swap_remove(position);
+            self.evict_expired();
+            self.available.push_back(snapshot);
+            if let Some(path) = partial_path {
+                let _ = std::fs::remove_file(path); // 清理可能的部分文件（尽力而为）。
+            }
+            return Ok(());
+        }
+        Err(IpcError::new(IpcErrorCode::InvalidInput, "快照不在进行中"))
+    }
+
+    pub fn available_count(&self) -> usize {
+        self.available.len()
+    }
+
+    pub fn consumed_count(&self) -> usize {
+        self.consumed_count
+    }
 }
 
 /// 预览脱敏报告：生成一次完整脱敏内容并存为服务端不可变快照，
@@ -299,11 +377,6 @@ pub fn preview_sanitized_report(
     let run = storage(&state)?.get_run(&run_id)?;
     let (content, filename) = build_report(&run, format);
     let snapshot_id = uuid::Uuid::new_v4().to_string();
-    let snapshot_id_json = serde_json::json!({ "snapshot_id": snapshot_id }).to_string();
-    if let Some(storage) = state.storage.as_deref() {
-        // 快照 id 经 settings 表传递给 export 命令（同进程，无网络）。
-        storage.set_setting(&format!("report.snapshot.{snapshot_id}"), &snapshot_id_json)?;
-    }
     let mut store = state
         .snapshot_store
         .lock()
@@ -315,7 +388,7 @@ pub fn preview_sanitized_report(
         content: content.clone(),
         filename: filename.clone(),
         created_at: std::time::Instant::now(),
-        exported: false,
+        state: SnapshotState::Available,
     });
     Ok(ReportPreview {
         run_id,
@@ -323,6 +396,7 @@ pub fn preview_sanitized_report(
         content,
         filename,
         note: REPORT_NOTE.to_string(),
+        snapshot_id,
     })
 }
 
@@ -355,18 +429,33 @@ pub fn export_sanitized_report(
         .add_filter("诊断报告", &[extension])
         .save_file()
     else {
-        // 用户取消：快照保留在存储中（未消费），用户可再次导出同一份字节。
-        let mut store = state
+        // 用户取消：快照回到 Available，同一份字节可再次导出。
+        state
             .snapshot_store
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        store.snapshots.push_back(snapshot);
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .release(&snapshot_id)?;
         return Err(IpcError::new(IpcErrorCode::Cancelled, "已取消导出"));
     };
 
-    std::fs::write(&path, &snapshot.content)
-        .map_err(|error| IpcError::new(IpcErrorCode::Internal, format!("写入文件失败：{error}")))?;
+    // 写盘失败：清理可能的部分文件，快照回到 Available（可重试）。
+    if let Err(error) = std::fs::write(&path, &snapshot.content) {
+        let _ = state
+            .snapshot_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .finish_failure(&snapshot_id, Some(&path));
+        return Err(IpcError::new(
+            IpcErrorCode::Internal,
+            format!("写入文件失败：{error}"),
+        ));
+    }
     let size_bytes = snapshot.content.len() as u64;
+    state
+        .snapshot_store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .finish_success(&snapshot_id)?;
 
     Ok(ExportResult {
         run_id,

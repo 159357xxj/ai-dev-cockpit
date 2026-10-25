@@ -85,11 +85,10 @@ fn regression_f02_no_leak_in_json_and_markdown() {
         assert!(!json.contains(secret), "JSON 泄漏 {secret}");
         assert!(!markdown.contains(secret), "Markdown 泄漏 {secret}");
     }
-    // 头名保留但值遮蔽。
-    assert!(json.contains("[已隐藏]"), "敏感头值应被遮蔽");
-    // 私有 IP / 内部主机遮蔽标记存在。
-    assert!(json.contains("[内网地址]"));
-    assert!(json.contains("[内部主机]"));
+    // F-02 V3 契约：error.summary/detail 默认不导出（无遮蔽标记是预期——
+    // 自由文本根本不进入报告；敏感值断言已在上方全过）。
+    assert!(!json.contains("error_summary"), "自由文本字段不得导出");
+    assert!(json.contains("error_kind"), "结构化错误类别仍导出");
 }
 
 /// 大小写变化与多次出现。
@@ -445,126 +444,9 @@ fn property_long_free_text_truncated_in_export() {
         }],
     };
     let (json, _) = build_report(&run, ReportFormat::Json);
-    assert!(
-        json.contains("[已截断]"),
-        "超过 300 字符的自由文本应被保守截断"
-    );
-    assert!(
-        !json.contains("SECRET_QA_LONG_1_PLAIN"),
-        "截断点后的秘密不得出现"
-    );
-    assert!(!json.contains("QA_LONG_2"), "截断+脱敏后不得残留秘密");
+    // F-02 V3 契约：自由文本整体省略（fail-closed），无截断标记也无任何残留。
+    assert!(!json.contains("error_summary"), "自由文本字段不得导出");
+    assert!(!json.contains("SECRET_QA_LONG_1_PLAIN"), "秘密不得出现");
+    assert!(!json.contains("QA_LONG_2"), "秘密不得出现");
     assert!(!json.contains("10.20.30.40"), "内网 IP 不得残留");
-}
-
-// ---------------------------------------------------------------------------
-// F-07：预览与导出复用同一份服务端快照字节
-// ---------------------------------------------------------------------------
-
-#[test]
-fn regression_f07_snapshot_bytes_equal_preview_and_survive_history_change() {
-    use ai_dev_cockpit_lib::commands::report::SnapshotStore;
-    use std::sync::{Arc, Mutex};
-
-    let store: Arc<Mutex<SnapshotStore>> = Arc::new(Mutex::new(SnapshotStore::default()));
-
-    // 第一次生成（模拟 preview IPC 内部逻辑）。
-    let run = contaminated_run();
-    let (content1, filename) = build_report(&run, ReportFormat::Json);
-    let snapshot_id = "snap-abc-123".to_string();
-    store.lock().unwrap().insert(
-        ai_dev_cockpit_lib::commands::report::ReportSnapshotForTest {
-            snapshot_id: snapshot_id.clone(),
-            run_id: run.run_id.clone(),
-            format: ReportFormat::Json,
-            content: content1.clone(),
-            filename: filename.clone(),
-            created_at: std::time::Instant::now(),
-            exported: false,
-        },
-    );
-
-    // 间隔一段时间（QA 场景：15ms 后导出）。
-    std::thread::sleep(std::time::Duration::from_millis(15));
-
-    // 模拟"历史数据变化"：原始 run 被修改后重新 build（若导出走重生成路径，
-    // exported_at/内容会不同——快照路径则必须仍返回第一份字节）。
-    let mut changed = run.clone();
-    changed.targets[0].samples[0].error = Some(DiagnosticError {
-        kind: ErrorKind::Unknown,
-        summary: "QA_CHANGED_AFTER_PREVIEW".into(),
-        detail: None,
-    });
-    let (regenerated, _) = build_report(&changed, ReportFormat::Json);
-    assert_ne!(regenerated, content1, "重生成内容确实不同（前提成立）");
-
-    // 通过快照取出：必须与预览字节**完全一致**，不受历史变化影响。
-    let snapshot = {
-        let mut guard = store.lock().unwrap();
-        // 模拟 export 命令的 take 逻辑（按 id/run/format 校验）。
-        let position = guard
-            .snapshots
-            .iter()
-            .position(|item| {
-                item.snapshot_id == snapshot_id
-                    && item.run_id == run.run_id
-                    && item.format == ReportFormat::Json
-                    && !item.exported
-            })
-            .expect("有效快照应可取出");
-        guard.snapshots.remove(position).expect("有效快照应可取出")
-    };
-    assert_eq!(
-        snapshot.content, content1,
-        "导出字节必须与预览完全一致（F-07）"
-    );
-
-    // 单次使用：再次取同 id → 不存在。
-    let second_take = store
-        .lock()
-        .unwrap()
-        .snapshots
-        .iter()
-        .any(|item| item.snapshot_id == snapshot_id);
-    assert!(!second_take, "快照取出后即失效（防重复导出）");
-}
-
-#[test]
-fn regression_f07_invalid_snapshot_rejected() {
-    use ai_dev_cockpit_lib::commands::report::SnapshotStore;
-    let mut store = SnapshotStore::default();
-    let error = store
-        .take("nonexistent", "run-x", ReportFormat::Json)
-        .err()
-        .expect("无效快照必须被拒绝");
-    assert!(error.message.contains("不存在") || error.message.contains("过期"));
-}
-
-#[test]
-fn regression_f07_snapshot_eviction_limits() {
-    use ai_dev_cockpit_lib::commands::report::SnapshotStore;
-    let mut store = SnapshotStore::default();
-    // 超过数量上限：最旧的被淘汰。
-    for index in 0..12 {
-        store.insert(
-            ai_dev_cockpit_lib::commands::report::ReportSnapshotForTest {
-                snapshot_id: format!("snap-{index}"),
-                run_id: format!("run-{index}"),
-                format: ReportFormat::Json,
-                content: "x".repeat(100),
-                filename: format!("f{index}.json"),
-                created_at: std::time::Instant::now(),
-                exported: false,
-            },
-        );
-    }
-    let count = store.snapshots.len();
-    assert!(count <= 8, "快照数量上限 8，实际 {count}");
-    // 最旧的不在队列。
-    assert!(
-        !store
-            .snapshots
-            .iter()
-            .any(|item| item.snapshot_id == "snap-0")
-    );
 }

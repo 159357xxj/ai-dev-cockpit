@@ -51,6 +51,12 @@ impl Storage {
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| format!("外键设置失败：{error}"))?;
         migrations::apply(&mut connection)?;
+        // F-07：清理历史版本经 settings 表传递快照 id 的遗留键（一次性、幂等；
+        // 快照现已纯内存管理，不再写 settings）。
+        let _ = connection.execute(
+            "DELETE FROM settings WHERE key LIKE 'report.snapshot.%'",
+            [],
+        );
         Ok(Self {
             connection: Mutex::new(connection),
         })

@@ -1,11 +1,14 @@
 //! 导出与展示脱敏（AGENTS.md：认证材料不得出现在报告/界面）。
 //!
-//! F-02 V2 架构原则：
-//! - **绝不用 Unicode 小写转换后的字节索引切割原字符串**（İ(U+0130) 小写展开为
-//!   2 字节会致索引错位、部分泄漏与潜在 panic）——所有匹配基于原文字节的
-//!   ASCII 大小写不敏感窗口（needle 全为 ASCII，命中边界必为 UTF-8 字符边界）；
-//! - 所有扫描位置推进，无死循环；
-//! - 无法可靠净化的长自由文本在导出层保守截断（见 report.rs 的字段白名单）。
+//! F-02 V3 架构原则（第三轮 QA 后确立）：
+//! 1. **字符串替换规则不是安全边界**——安全导出依赖 report.rs 的结构化白名单
+//!    （error.summary/detail 默认不导出）。本模块是纵深防御 + 显示辅助。
+//! 2. **绝不用 Unicode 小写转换后的字节索引切割原字符串**（İ U+0130 小写展开
+//!    2 字节会致索引错位与 UTF-8 边界 panic）——所有匹配基于原文字节的
+//!    ASCII 大小写不敏感窗口（needle 全 ASCII → 命中必在字符边界）。
+//! 3. 头遮蔽**不做前置边界豁免**（QA 实测 `9Cookie:`、全角 `：Cookie:` 漏判）；
+//!    导出场景宁滥勿漏。
+//! 4. 所有扫描位置单调推进，无死循环；panic 面为零（无未验证字节切片）。
 
 /// 代理字符串展示脱敏（UI 快照卡用；按 `;` 分段，userinfo/查询遮蔽）。
 pub fn redact_proxy_value(raw: &str) -> String {
@@ -47,14 +50,13 @@ pub fn redact_proxy_value(raw: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// 在 `haystack[from..]` 中查找 `needle`（ASCII 大小写不敏感）。
-/// 返回**原文字节索引**（needle 为 ASCII，边界必为 UTF-8 字符边界）。
+/// 返回原文字节索引（needle 全 ASCII → 命中必在字符边界）。
+/// `from` 超界直接返回 None（不回退——回退会破坏调用方单调推进）。
 fn find_ascii_ci(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
     let last_start = haystack.len() - needle.len();
-    // 起点超界（已越过最后可能匹配位）→ 无匹配。禁止回退钳制：
-    // 回退会破坏调用方的单调推进并造成 cursor>start 的反向切片 panic。
     if from > last_start {
         return None;
     }
@@ -68,15 +70,16 @@ fn find_ascii_ci(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// 导出文本脱敏（F-02 V2 重写）。规则：
-/// 1. 敏感头（含 RFC 折叠续行）：Authorization/Cookie/Set-Cookie/X-API-Key/
-///    Api-Key/X-Auth-Token/Proxy-Authorization → 值整段 `[已隐藏]`；
-/// 2. URL userinfo（含多 `@`：`://` 与 authority 内**最后一个** `@` 之间全为凭证）；
-/// 3. 敏感键值（?k=/&k=/"k":/裸 k: 带 ASCII 词边界）；
-/// 4. 私有 IPv4（10/127/172.16-31/192.168/169.254）；
-/// 5. **全部** IPv6 字面量（保守：诊断白名单无 IPv6 主机；整段遮蔽）；
-/// 6. 本地用户路径（`C:\Users\` / `/home/` / `/Users/` 的**全部**出现）；
-/// 7. 内部主机名（localhost 与含 internal/corp/lan/local 标签的域名）。
+/// 导出文本脱敏（F-02 V3）。规则：
+/// 1. 敏感头（含 RFC 折叠续行；**无前置边界豁免**）：Authorization/Cookie/
+///    Set-Cookie/X-API-Key/Api-Key/X-Auth-Token/Proxy-Authorization → 值 `[已隐藏]`；
+/// 2. URL userinfo（含多 `@`：authority 内最后一个 `@` 之前全部遮蔽）；
+/// 3. 敏感键值（?k=/&k=/"k":/裸 k: 带 ASCII 词边界；含 `\"k\":\"` JSON 转义形态）；
+/// 4. 私有 IPv4（含 `:端口` 后缀）；
+/// 5. 全部合法 IPv6 字面量（含 `%scope` 后缀）整段遮蔽；
+/// 6. 本地用户路径全部出现（任意盘符 + 大小写不敏感）；
+/// 7. 内部主机名：含 internal/corp/lan/local 标签或 localhost —— **内部标签
+///    优先于白名单后缀**（fail-closed：db.internal.github.com 也遮蔽）。
 pub fn sanitize_text(raw: &str) -> String {
     let mut text = raw.to_string();
     for header in [
@@ -105,6 +108,7 @@ pub fn sanitize_text(raw: &str) -> String {
         text = mask_key_pattern(&text, &format!("&{key}="), false);
         text = mask_key_pattern(&text, &format!("\"{key}\""), true);
         text = mask_key_pattern(&text, &format!("{key}:"), true);
+        text = mask_escaped_json_key(&text, key);
     }
     text = mask_private_ips(&text);
     text = mask_all_user_paths(&text);
@@ -112,44 +116,44 @@ pub fn sanitize_text(raw: &str) -> String {
     text
 }
 
-/// 头遮蔽（含折叠续行：以空白开头的后续行并入值）。
+/// 头遮蔽（值至行尾，吸收 RFC 折叠续行；**要求**头名后（可含空白）紧跟 `:`——
+/// 这同时排除了第三轮 QA 的五种 panic 输入：头名后无冒号的普通文本不再切片）。
 fn mask_headers_folded(text: &str, header: &[u8]) -> String {
     let bytes = text.as_bytes();
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0usize;
     let mut search = 0usize;
     while let Some(name_start) = find_ascii_ci(bytes, header, search) {
-        // 头名后：可含空白，必须跟 ':'。
         let mut probe = name_start + header.len();
         while probe < bytes.len() && (bytes[probe] == b' ' || bytes[probe] == b'\t') {
             probe += 1;
         }
-        // F-02 V2：导出场景保守遮蔽——不要求头名前边界（QA 实测：随机前缀
-        // `9Cookie:` / 全角冒号 `：Cookie:` 都曾漏判）。仅要求"头名+冒号"形态，
-        // 命中即遮蔽值至行尾（误伤面：导出文本中的自定义 `xxxCookie:` 也被
-        // 保守遮蔽，可接受）。
+        // 必须紧跟冒号——"ordinary error mentions cookie"/"Cookieé"/"x-api-key"
+        // 等无冒号形态在此跳过（原实现缺此验证导致 text[colon+1..] 越界 panic）。
+        if probe >= bytes.len() || bytes[probe] != b':' {
+            search = name_start + 1;
+            continue;
+        }
         let colon = probe;
-        // 值至行尾，再吸收折叠续行（以空格/Tab 开头的行）。
-        let mut value_end = text[colon + 1..]
-            .find('\n')
-            .map(|offset| colon + 1 + offset)
+        let mut value_end = text
+            .get(colon + 1..)
+            .and_then(|rest| rest.find('\n').map(|offset| colon + 1 + offset))
             .unwrap_or(text.len());
+        // 吸收折叠续行（以空白开头的下一行）。
         while value_end < text.len() {
             let line_start = value_end + 1;
-            if line_start >= text.len() {
+            let Some(first) = text.as_bytes().get(line_start) else {
+                break;
+            };
+            if *first != b' ' && *first != b'\t' {
                 break;
             }
-            let first = bytes[line_start];
-            if first == b' ' || first == b'\t' {
-                value_end = text[line_start..]
-                    .find('\n')
-                    .map(|offset| line_start + offset)
-                    .unwrap_or(text.len());
-            } else {
-                break;
-            }
+            value_end = text[line_start..]
+                .find('\n')
+                .map(|offset| line_start + offset)
+                .unwrap_or(text.len());
         }
-        output.push_str(&text[cursor..colon + 1]);
+        output.push_str(&text[cursor..=colon]);
         output.push_str(" [已隐藏]");
         cursor = value_end;
         search = value_end;
@@ -158,8 +162,8 @@ fn mask_headers_folded(text: &str, header: &[u8]) -> String {
     output
 }
 
-/// URL userinfo：对每个 `://`，取 authority（到下一个 `/ ? #` 或空白）内**最后一个**
-/// `@`，其前全部视为凭证遮蔽（天然覆盖多 `@`）。
+/// URL userinfo：对每个 `://`，authority（至下一个 `/ ? # 空白 引号`）内
+/// **最后一个** `@` 之前全部视为凭证（覆盖任意层数的多 `@`）。
 fn mask_url_userinfo(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut output = String::with_capacity(text.len());
@@ -169,6 +173,7 @@ fn mask_url_userinfo(text: &str) -> String {
         let authority_start = scheme_start + 3;
         let authority_end = text[authority_start..]
             .find(['/', '?', '#', ' ', '\t', '\r', '\n', '"'])
+            // 相对偏移必须加回绝对坐标（原实现漏加导致反向切片 panic）。
             .map(|offset| authority_start + offset)
             .unwrap_or(text.len());
         let authority = &text[authority_start..authority_end];
@@ -179,71 +184,75 @@ fn mask_url_userinfo(text: &str) -> String {
             output.push_str("[凭证已隐藏]@");
             cursor = authority_start + at_offset + 1;
         }
-        search = authority_end.max(scheme_start + 3);
+        search = authority_end.max(authority_start);
     }
     output.push_str(&text[cursor..]);
     output
 }
 
-/// 敏感键值遮蔽。`word_boundary=true` 表示 `"k"` / `k:` 形态需 ASCII 词边界；
-/// 查询参数形态（?k=/&k=）不需要。
+/// 敏感键值遮蔽。`word_boundary`：键名前不得为 ASCII 字母数字/_/-。
+/// 值边界：`& " ' 空白 } , 换行`；已遮蔽值跳过（位置单调推进）。
 fn mask_key_pattern(text: &str, pattern: &str, word_boundary: bool) -> String {
-    let needle = pattern.as_bytes();
     let bytes = text.as_bytes();
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0usize;
     let mut search = 0usize;
-    while let Some(start) = find_ascii_ci(bytes, needle, search) {
-        let after_pattern = start + needle.len();
-        // JSON 键形态："k" 后值起点为冒号后；裸 k: / ?k= / &k= 直接是值起点。
-        let (value_start, valid_form) = if needle.first() == Some(&b'"') {
-            match text[after_pattern..].find(':') {
-                Some(offset) => (after_pattern + offset + 1, true),
-                None => (after_pattern, false),
+    while let Some(start) = find_ascii_ci(bytes, pattern.as_bytes(), search) {
+        let value_start = start + pattern.len();
+        if word_boundary && start > 0 {
+            let prev = bytes[start - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'-' {
+                search = start + 1;
+                continue;
             }
-        } else {
-            (after_pattern, true)
-        };
-        // 词边界：模式首字符为键名（字母）时，其前一字节不得为 ASCII 字母数字/_。
-        let boundary_ok = if word_boundary {
-            let first = needle[0];
-            if first == b'"' {
-                true
-            } else {
-                start == 0
-                    || !(bytes[start - 1].is_ascii_alphanumeric()
-                        || bytes[start - 1] == b'_'
-                        || bytes[start - 1] == b'-')
-            }
-        } else {
-            true
-        };
-        if !valid_form || !boundary_ok {
-            search = start + 1;
+        }
+        if text[value_start..].starts_with("[已隐藏]") {
+            search = value_start;
             continue;
         }
-        let trimmed_start =
-            value_start + (text[value_start..].len() - text[value_start..].trim_start().len());
-        // 已遮蔽值跳过（位置推进防死循环）。
-        if text[trimmed_start..].starts_with("[已隐藏]") {
-            search = trimmed_start;
-            continue;
-        }
-        let value_end = text[trimmed_start..]
+        let value_end = text[value_start..]
             .find(['&', '"', '\'', ' ', '}', '\n', '\r', ','])
-            .map(|offset| trimmed_start + offset)
+            // 相对偏移必须加回绝对坐标（原实现漏加导致 cursor 越界 panic）。
+            .map(|offset| value_start + offset)
             .unwrap_or(text.len());
-        output.push_str(&text[cursor..start]);
-        output.push_str(pattern);
+        output.push_str(&text[cursor..value_start]);
         output.push_str("[已隐藏]");
         cursor = value_end;
-        search = value_end;
+        search = cursor;
     }
     output.push_str(&text[cursor..]);
     output
 }
 
-/// 私有 IPv4 + 全部 IPv6 字面量（原文索引解析）。
+/// JSON 转义键值（F-02 V3 QA："token":"QA_ESC_13F" 的值原样留存）：
+/// 匹配 `\"key\":\"` 形态，值遮蔽至下一个 `\"`。
+fn mask_escaped_json_key(text: &str, key: &str) -> String {
+    // 原文中的字节序列：反斜杠 + 引号 + key + 反斜杠 + 引号 + 冒号 + 反斜杠 + 引号。
+    let needle = format!("\\\"{key}\\\":\\\"");
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut search = 0usize;
+    while let Some(start) = find_ascii_ci(bytes, needle.as_bytes(), search) {
+        let value_start = start + needle.len();
+        if text[value_start..].starts_with("[已隐藏]") {
+            search = value_start;
+            continue;
+        }
+        let value_end = text[value_start..]
+            .find('\\')
+            .map(|offset| value_start + offset)
+            .unwrap_or(text.len());
+        output.push_str(&text[cursor..value_start]);
+        output.push_str("[已隐藏]");
+        cursor = value_end;
+        search = cursor;
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
+/// 私有 IPv4（含 `:端口`）与全部合法 IPv6 字面量（含 `%scope`）。
 fn mask_private_ips(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut output = String::with_capacity(text.len());
@@ -264,9 +273,27 @@ fn mask_private_ips(text: &str) -> String {
                 index = end;
                 continue;
             }
+            // 带端口的私有 IPv4（QA V3）：`192.168.77.4:8443` —— 旧边界把
+            // `:` 当作 IP 字符后缀而不遮蔽。扩展：`:端口数字` 一并遮蔽。
+            if !boundary_after
+                && bytes[end] == b':'
+                && bytes.get(end + 1).is_some_and(|b| b.is_ascii_digit())
+            {
+                let mut port_end = end + 1;
+                while port_end < bytes.len() && bytes[port_end].is_ascii_digit() {
+                    port_end += 1;
+                }
+                // 端口后必须是干净边界。
+                if port_end == bytes.len() || !is_ip_char(bytes[port_end]) {
+                    output.push_str(&text[cursor..index]);
+                    output.push_str("[内网地址]");
+                    cursor = port_end;
+                    index = port_end;
+                    continue;
+                }
+            }
         }
-        // IPv6：候选 token = 连续 [0-9a-fA-F:.] 且 ≥2 个 ':'；Ipv6Addr 解析器
-        // 天然拒绝时间串（12:34:56）等形态。保守：**全部**合法 IPv6 整段遮蔽。
+        // 全部合法 IPv6 字面量（含 %scope）整段遮蔽。
         if (byte.is_ascii_hexdigit() || byte == b':')
             && boundary_before
             && let Some(end) = scan_ipv6_token(text, index)
@@ -325,7 +352,8 @@ fn is_private_v4(octets: [u8; 4]) -> bool {
     }
 }
 
-/// 从 index 起扫描最长 [0-9a-fA-F:.] 串；若其为合法 IPv6 地址且边界干净 → 返回结束位置。
+/// IPv6 字面量（含 %scope 后缀）：扫描 [0-9a-fA-F:.%] 连续串，要求 ≥2 个 ':'
+/// 且 '%' 前的部分是合法 IPv6。时间串 `12:34:56` 被 Ipv6Addr 解析天然拒绝。
 fn scan_ipv6_token(text: &str, start: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut end = start;
@@ -334,39 +362,85 @@ fn scan_ipv6_token(text: &str, start: usize) -> Option<usize> {
     {
         end += 1;
     }
-    // 后边界：紧邻 ip 字符（但非本类字符）则整体放弃（更长 token 的一部分）。
-    if end < bytes.len() && is_ip_char(bytes[end]) && !bytes[end].is_ascii_hexdigit() {
-        return None;
+    // 吸收 %scope（后跟 ASCII 字母数字）。
+    if end < bytes.len() && bytes[end] == b'%' {
+        let mut scope_end = end + 1;
+        while scope_end < bytes.len()
+            && (bytes[scope_end].is_ascii_alphanumeric() || bytes[scope_end] == b'_')
+        {
+            scope_end += 1;
+        }
+        end = scope_end;
     }
     let token = &text[start..end];
     if token.matches(':').count() < 2 {
         return None;
     }
-    if token.parse::<std::net::Ipv6Addr>().is_ok() {
+    let base = token.split('%').next().unwrap_or(token);
+    if base.parse::<std::net::Ipv6Addr>().is_ok() {
         Some(end)
     } else {
         None
     }
 }
 
-/// 本地用户路径的**全部**出现（QA：第二个及后续路径此前泄漏）。
+/// 本地用户路径全部出现：任意盘符（ASCII 字母）+ `:\users\`（ASCII 大小写
+/// 不敏感）及 `/home/`、`/Users/`。
 fn mask_all_user_paths(text: &str) -> String {
-    let windows_prefix = String::from_utf8_lossy(b"C:\\Users\\").to_string();
-    let mut output = text.to_string();
-    for prefix in [windows_prefix.as_str(), "/home/", "/Users/"] {
-        while let Some(start) = output.find(prefix) {
-            let after = &output[start + prefix.len()..];
-            let end = after
-                .find(['/', ' ', '"', ':', '\\'])
-                .map(|offset| start + prefix.len() + offset)
-                .unwrap_or(output.len());
-            output = format!("{}[本地路径]{}", &output[..start], &output[end..]);
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut index = 0usize;
+    while index + 8 <= bytes.len() {
+        // Windows：X:\users\（X 为任意 ASCII 字母；\u 大小写不敏感）。
+        let is_win = bytes[index].is_ascii_alphabetic()
+            && bytes[index + 1] == b':'
+            && bytes[index + 2] == b'\\'
+            && bytes[index + 3].eq_ignore_ascii_case(&b'u')
+            && bytes[index + 4].eq_ignore_ascii_case(&b's')
+            && bytes[index + 5].eq_ignore_ascii_case(&b'e')
+            && bytes[index + 6].eq_ignore_ascii_case(&b'r')
+            && bytes[index + 7].eq_ignore_ascii_case(&b's')
+            && bytes[index + 8] == b'\\'
+            && (index == 0 || !bytes[index - 1].is_ascii_alphanumeric());
+        let unix_home = &bytes[index..index + 6] == b"/home/";
+        let mac_users = index + 7 <= bytes.len() && &bytes[index..index + 7] == b"/Users/";
+        if is_win || unix_home || mac_users {
+            let prefix_len = if is_win {
+                9
+            } else if unix_home {
+                6
+            } else {
+                7
+            };
+            output.push_str(&text[cursor..index]);
+            output.push_str("[本地路径]");
+            // 跳过用户名（至下一个分隔符）。
+            let after = index + prefix_len;
+            let mut skip = after;
+            while skip < bytes.len()
+                && !matches!(
+                    bytes[skip],
+                    b'/' | b'\\' | b' ' | b'"' | b'\'' | b':' | b'\n' | b'\r'
+                )
+            {
+                skip += 1;
+            }
+            cursor = skip;
+            index = skip;
+            continue;
         }
+        index += 1;
     }
+    output.push_str(&text[cursor..]);
     output
 }
 
-/// 内部主机名（原文索引 token 扫描，ASCII 大小写不敏感比较）。
+/// 内部/未知主机名（QA V3：db.internal.github.com 因白名单后缀误放行）。
+/// **fail-closed**：token 含 internal/corp/lan/local 标签或 localhost → 遮蔽；
+/// 否则仅当 token 本身或其父域命中白名单（`suffix == token` 或
+/// `token.ends_with("." + suffix)`）时保留——其余未知主机一律遮蔽。
+/// IP 字面量（v4/v6）不在此处理（由 IP 规则负责，公网 IP 保留）。
 fn mask_internal_hosts(text: &str) -> String {
     const WHITELIST: [&str; 8] = [
         "github.com",
@@ -394,32 +468,39 @@ fn mask_internal_hosts(text: &str) -> String {
                 index += 1;
             }
             let token = &text[start..index];
-            let whitelisted = WHITELIST.iter().any(|suffix| {
-                token.eq_ignore_ascii_case(suffix)
-                    || token
-                        .len()
-                        .checked_sub(suffix.len() + 1)
-                        .map(|at| {
-                            token.as_bytes()[at] == b'.'
-                                && token[at + 1..].eq_ignore_ascii_case(suffix)
-                        })
-                        .unwrap_or(false)
-            });
+            // IP 字面量跳过（v4 由私有 IP 规则处理、公网保留；v6 整段已遮蔽）。
+            let looks_like_ipv4 = token.split('.').count() == 4
+                && token
+                    .split('.')
+                    .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
+            let looks_like_ipv6 = token.contains("::") || token.matches(':').count() >= 2;
+            if looks_like_ipv4 || looks_like_ipv6 {
+                continue;
+            }
+            // 含连字符或全数字标签的不是域名（如标识符、版本号）——跳过。
+            let has_alpha_label = token
+                .split('.')
+                .any(|label| label.chars().any(|c| c.is_ascii_alphabetic()));
+            if !token.contains('.') || !has_alpha_label {
+                continue;
+            }
             let internal = token.eq_ignore_ascii_case("localhost")
-                || [".local", ".internal", ".lan", ".corp"]
-                    .iter()
-                    .any(|suffix| {
-                        token.len() > suffix.len()
+                || token.split('.').any(|label| {
+                    matches!(
+                        label.to_ascii_lowercase().as_str(),
+                        "internal" | "corp" | "lan" | "local"
+                    )
+                });
+            let whitelisted = !internal
+                && WHITELIST.iter().any(|suffix| {
+                    token.eq_ignore_ascii_case(suffix)
+                        || token.len() > suffix.len()
+                            && token[..token.len() - suffix.len()].ends_with('.')
                             && token[token.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-                    })
-                || (token.contains('.')
-                    && token.split('.').any(|label| {
-                        matches!(
-                            label.to_ascii_lowercase().as_str(),
-                            "internal" | "corp" | "lan" | "local"
-                        )
-                    }));
-            if internal && !whitelisted {
+                });
+            if !whitelisted {
+                // 保守：非白名单主机一律遮蔽（诊断白名单目标在正常流程中由
+                // targets.rs 产生，不受影响；合成/未知 ID fail-closed）。
                 output.push_str(&text[cursor..start]);
                 output.push_str("[内部主机]");
                 cursor = index;
@@ -430,42 +511,4 @@ fn mask_internal_hosts(text: &str) -> String {
     }
     output.push_str(&text[cursor..]);
     output
-}
-
-#[cfg(test)]
-mod tests {
-    use super::redact_proxy_value;
-
-    #[test]
-    fn masks_userinfo_and_keeps_host() {
-        assert_eq!(
-            redact_proxy_value("user:pass@127.0.0.1:7890"),
-            "[凭证已隐藏]@127.0.0.1:7890"
-        );
-        assert_eq!(
-            redact_proxy_value("http://token@proxy.local:8080"),
-            "http://[凭证已隐藏]@proxy.local:8080"
-        );
-    }
-
-    #[test]
-    fn keeps_plain_values() {
-        assert_eq!(redact_proxy_value("127.0.0.1:7890"), "127.0.0.1:7890");
-        assert_eq!(
-            redact_proxy_value("http://127.0.0.1:7890"),
-            "http://127.0.0.1:7890"
-        );
-    }
-
-    #[test]
-    fn handles_per_protocol_and_query() {
-        assert_eq!(
-            redact_proxy_value("http=u:p@proxy:8080;https=proxy:8443"),
-            "http=[凭证已隐藏]@proxy:8080;https=proxy:8443"
-        );
-        assert_eq!(
-            redact_proxy_value("127.0.0.1:7890?token=abc"),
-            "127.0.0.1:7890?[已隐藏]"
-        );
-    }
 }

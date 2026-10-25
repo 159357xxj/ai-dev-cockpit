@@ -12,7 +12,7 @@
 | F-02 导出脱敏 | FAIL（六类泄漏/部分泄漏） | **已修复**：sanitize_text V2 重写 + 结构化白名单导出 + 保守截断；QA 六场景全部由失败转通过；性质测试 3 项（600+ 随机输入）无 panic/无死循环/长度有界/已知秘密不漏 |
 | F-07 预览≠导出 | FAIL（exported_at 重新生成） | **已修复**：服务端不可变 ReportSnapshot；预览与导出复用同一份脱敏字节；字节一致回归通过 |
 | F-04 文档一致性 | 部分 FAIL | **已修复**：README 状态表重写、测试数 119+35、R11 冲突消除；ARCHITECTURE 补 `format` 与 `snapshot_id` 签名 |
-| OpenSSL 可移植性 | 两轮记录 | **已从源头解决**：TLS mock 生成最小 `openssl.cnf` 并以**进程级** `OPENSSL_CONF` 传给子进程；干净环境（`env -u OPENSSL_CONF`）下 13 项代理/TLS 测试全绿，无 Conda/Git Bash 依赖 |
+| OpenSSL 可移植性 | 两轮记录 | **已解决 OPENSSL_CONF 配置路径问题**：TLS mock 生成最小 `openssl.cnf` 并以进程级 `OPENSSL_CONF` 传给子进程；`env -u OPENSSL_CONF` 下 13 项测试全绿。~~无 Conda/Git Bash 依赖~~ **（V3 QA 更正：openssl.exe 本身仍是 PATH 上的外部依赖，本机来自 Miniconda；已在 V4 修复中于 CI 显式定位 Git for Windows 自带的 openssl 并在 README 如实声明）** |
 
 ## 2. 每项修复的文件与核心改动
 

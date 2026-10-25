@@ -38,6 +38,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      # F-08: TLS mock tests depend on openssl.exe (test RSA cert generation).
+      # windows-latest ships Git for Windows (with openssl); add it to PATH explicitly.
+      - name: Locate openssl (TLS mock test dependency)
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "C:\Program Files\Git\usr\bin"
       - run: cargo fmt --check
         working-directory: src-tauri
       - run: cargo clippy --all-targets -- -D warnings

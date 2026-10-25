@@ -136,7 +136,7 @@ Phase 4 正式关闭。
 | 网络目标白名单 | `targets.rs` 6 个预设 https 域名，生产装配仅此来源；重定向规则锁定白名单主机+https+443；`no_proxy()` 显式；手动代理仅 loopback |
 | 重试 | `.retry(never())` 显式禁用 reqwest 默认 h2/h3 NACK 重发（D-018） |
 | SQLite | 全参数化；user_version 迁移只向前；事务写入；重复保存幂等（INSERT OR REPLACE + 样本重置）；D-014 取消口径 |
-| 脱敏 | sanitize_text：userinfo/敏感查询参数/本地用户路径/Authorization；遮蔽循环位置推进（死循环缺陷已在 P5 修复并有测试）；嵌套字段仅 error.summary/detail（规则引擎输出为固定文案，攻击面有限） |
+| 脱敏 | **两级防线**：① 导出契约（F-02 V3）——error.summary/detail 默认不导出，target_id 白名单 fail-closed，仅导出枚举/数字/时间戳/规则引擎固定文案；② sanitize_text 纵深防御（展示辅助）——敏感头（含折叠续行）/userinfo（多 @）/敏感键值（含 JSON 转义）/私有 IPv4（含端口）/全部 IPv6（含 scope）/用户路径（任意盘符大小写）/内部主机名（fail-closed）；全文字节索引安全（QA 三轮 panic 均已根治并有性质测试守护） |
 | Demo | 默认 false；**release 构建硬关**（DEMO_AVAILABLE=import.meta.env.DEV，设置页隐藏） |
 | 自动联网 | 无：启动仅本地读取（代理快照/SQLite），网络请求仅由用户点击触发 |
 | 凭证 | 不读取/存储/上传任何 Cookie/令牌/密钥；settings 表仅白名单键 |
