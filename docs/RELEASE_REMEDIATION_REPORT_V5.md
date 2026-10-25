@@ -2,7 +2,7 @@
 
 修复日期：2026-10-26（Asia/Shanghai）
 依据：`docs/RELEASE_ACCEPTANCE_REPORT_V4.md`（F-07-DATA 用户文件误删、F-02 恶意字段注入、F-07-LIMIT 资源上限、F-07-TEST 失败测试、SQLITE-CLEANUP 静默、F-08 CI openssl 检查）
-产品修复提交：`e31b0cf`（本地 main，领先 origin/main 9 个提交，未推送）。
+产品修复提交：`94bd645`（本地 main，领先 origin/main 9 个提交，未推送）。
 原则：保留 V4 已通过的快照状态机语义（未推翻重做）；文件保护与字段契约从根因层修复。
 
 ## 1. 缺陷处理状态
@@ -102,7 +102,7 @@ save_report_atomic(target, content):
 
 | 项 | 值 |
 |---|---|
-| Git Commit | `e31b0cf`（本地 main，领先 origin/main 9 个提交，未推送） |
+| Git Commit | `94bd645`（本地 main，领先 origin/main 9 个提交，未推送） |
 | 版本 | 0.1.0 |
 | 绝对路径 | `E:\ai-dev-cockpit\src-tauri\target\release\bundle\nsis\AI Dev Cockpit_0.1.0_x64-setup.exe` |
 | 大小 | 2,794,359 字节（2.66 MiB） |
