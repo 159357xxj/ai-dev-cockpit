@@ -13,6 +13,7 @@ import { SettingsProvider } from '@/app/settings';
 import { createAppRouter } from '@/app/router';
 
 const cancelMock = vi.fn();
+const diagnoseRunsMock = vi.fn();
 const handlerStack: DiagnosticRunHandlers[] = [];
 let requestLog: Array<{ mode: string; manual: string | null }> = [];
 
@@ -24,7 +25,10 @@ vi.mock('@/lib/api', () => ({
   }),
   cancelDiagnostic: (...args: unknown[]) => cancelMock(...args),
   normalizeIpcError: (raw: unknown) => raw as { code: string; message: string },
-  api: { cancelDiagnostic: (...args: unknown[]) => cancelMock(...args) },
+  api: {
+    cancelDiagnostic: (...args: unknown[]) => cancelMock(...args),
+    diagnoseRuns: (...args: unknown[]) => diagnoseRunsMock(...args),
+  },
 }));
 
 function renderCompare(): void {
@@ -88,6 +92,8 @@ beforeEach(() => {
   handlerStack.length = 0;
   requestLog = [];
   cancelMock.mockReset();
+  diagnoseRunsMock.mockReset();
+  diagnoseRunsMock.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -129,6 +135,10 @@ describe('路径对比页（真实模式）', () => {
     expect(await screen.findByText('50%')).toBeInTheDocument();
     // 请求顺序：先 no_app_proxy 后 library_default
     expect(requestLog.map((entry) => entry.mode)).toEqual(['no_app_proxy', 'library_default']);
+    // 批次结束后用两个 run 请求规则诊断（R10 跨运行规则的输入）
+    await vi.waitFor(() => expect(diagnoseRunsMock).toHaveBeenCalledTimes(1));
+    const runsArg = diagnoseRunsMock.mock.calls[0][0] as Array<{ run_id: string }>;
+    expect(runsArg).toHaveLength(2);
     // 无演示标识（真实模式）
     expect(screen.queryAllByText('演示数据')).toHaveLength(0);
   });

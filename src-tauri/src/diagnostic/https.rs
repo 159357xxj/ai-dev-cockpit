@@ -84,6 +84,9 @@ pub struct HttpsProbeParams {
     pub manual_proxy_url: Option<String>,
     pub timeout: Duration,
     pub rules: RedirectRules,
+    /// 测试专用：额外信任的根证书（DER）。生产恒为 None——这只是把测试 CA
+    /// 加入信任库，绝不关闭/绕过生产证书校验（Phase 4 补强 2）。
+    pub additional_trusted_root_der: Option<Vec<u8>>,
 }
 
 fn redirect_policy(rules: RedirectRules) -> reqwest::redirect::Policy {
@@ -128,49 +131,77 @@ fn error_sample(
     }
 }
 
-/// 传输层错误分类（reqwest 错误 → ErrorKind）。
-/// DNS 已在 reqwest 内部处理：解析失败会出现在 connect 错误链中，
-/// 以错误文本识别；连接被拒 → `tcp_failure`；其余 connect 阶段错误
-/// （TLS 握手失败为主）→ `tls_failure`。无法归因时如实返回 `unknown`。
-fn classify_transport_error(error: &reqwest::Error) -> (ErrorKind, String) {
-    if error.is_timeout() {
-        return (
-            ErrorKind::Timeout,
-            format!("请求在超时窗口内未完成：{error}"),
-        );
+/// 传输层错误分类——纯函数（Phase 4 补强 1：结构化信号优先，可表驱动测试）。
+///
+/// 优先级：
+/// 1. 结构化 `is_timeout` → `timeout`；
+/// 2. 结构化：connect 且错误链含 `ConnectionRefused`（结构化判定的布尔结果）
+///    → `tcp_failure`；
+/// 3. 文本：链中含 DNS 解析失败特征 → `dns_failure`（reqwest/hyper 无结构化
+///    DNS 错误类型，getaddrinfo 失败以 `Uncategorized` io 错误呈现——文本是
+///    唯一可用信号，匹配保守：仅三条已知文案）；
+/// 4. 结构化 `is_connect`（剩余连接阶段错误，以 TLS 握手失败为主）→ `tls_failure`；
+/// 5. 其余一律 `unknown`——**无法确定时明确允许 unknown，不强行归因**。
+fn classify_from_chain(
+    is_timeout: bool,
+    is_connect: bool,
+    refused: bool,
+    chain: &[String],
+) -> ErrorKind {
+    if is_timeout {
+        return ErrorKind::Timeout;
     }
-    if error.is_connect() {
-        let mut refused = false;
-        let mut dns_like = false;
-        let mut chain = vec![error.to_string()];
-        let mut source = std::error::Error::source(error);
-        while let Some(current) = source {
-            let text = current.to_string();
-            if text.contains("failed to lookup address information")
+    if is_connect {
+        let dns_like = chain.iter().any(|text| {
+            text.contains("failed to lookup address information")
                 || text.contains("resolves to none")
                 || text.to_lowercase().contains("no such host")
-            {
-                dns_like = true;
-            }
-            if current
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::ConnectionRefused)
-            {
-                refused = true;
-            }
-            chain.push(text);
-            source = current.source();
+        });
+        if dns_like {
+            return ErrorKind::DnsFailure;
         }
-        let kind = if dns_like {
-            ErrorKind::DnsFailure
-        } else if refused {
-            ErrorKind::TcpFailure
-        } else {
-            ErrorKind::TlsFailure
-        };
-        return (kind, chain.join(" | "));
+        if refused {
+            return ErrorKind::TcpFailure;
+        }
+        return ErrorKind::TlsFailure;
     }
-    (ErrorKind::Unknown, format!("未归因请求错误：{error}"))
+    ErrorKind::Unknown
+}
+
+/// 从 reqwest 错误提取（is_timeout, is_connect, refused, 错误链文本）。
+fn error_chain(error: &reqwest::Error) -> (bool, bool, bool, Vec<String>) {
+    let mut chain = vec![error.to_string()];
+    let mut source = std::error::Error::source(error);
+    let mut refused = false;
+    while let Some(current) = source {
+        if current
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::ConnectionRefused)
+        {
+            refused = true;
+        }
+        chain.push(current.to_string());
+        source = current.source();
+    }
+    (
+        error.is_timeout(),
+        error.is_connect() || refused,
+        refused,
+        chain,
+    )
+}
+
+/// 传输层错误分类（reqwest 错误 → ErrorKind + 链文本）。
+fn classify_transport_error(error: &reqwest::Error) -> (ErrorKind, String) {
+    let (is_timeout, is_connect, refused, chain) = error_chain(error);
+    let kind = classify_from_chain(is_timeout, is_connect, refused, &chain);
+    if kind == ErrorKind::Unknown {
+        return (
+            kind,
+            format!("未归因请求错误（允许 unknown）：{}", chain.join(" | ")),
+        );
+    }
+    (kind, chain.join(" | "))
 }
 
 fn classify_status(status: u16) -> (bool, HttpOutcome) {
@@ -196,6 +227,13 @@ fn build_client(params: &HttpsProbeParams) -> Result<reqwest::Client, String> {
         // D-018（源码实证）：reqwest 0.12 默认对 h2/h3 协议 NACK 隐式重试；
         // 显式 never() 兑现"一次采样 = 恰好一次请求"的契约。
         .retry(reqwest::retry::never());
+
+    // 测试专用受信根（Phase 4 补强 2）：仅扩展信任库，绝不关闭证书校验。
+    if let Some(root_der) = &params.additional_trusted_root_der {
+        let certificate = reqwest::Certificate::from_der(root_der)
+            .map_err(|error| format!("测试根证书解析失败：{error}"))?;
+        builder = builder.add_root_certificate(certificate);
+    }
 
     match params.route_mode {
         RouteMode::NoAppProxy => {
@@ -385,5 +423,94 @@ pub async fn probe_https(params: &HttpsProbeParams, cancel: CancellationToken) -
         http_outcome: Some(outcome),
         error: None,
         tested_at: now_rfc3339(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase 4 补强 1：分类器纯函数表驱动测试（可重复，不依赖真实网络错误）。
+    #[test]
+    fn classify_chain_table_driven() {
+        type ClassifyCase = (&'static str, bool, bool, bool, Vec<String>, ErrorKind);
+        let cases: Vec<ClassifyCase> = vec![
+            (
+                "超时优先",
+                true,
+                true,
+                false,
+                vec!["timeout".to_string()],
+                ErrorKind::Timeout,
+            ),
+            (
+                "结构化拒连",
+                false,
+                true,
+                true,
+                vec!["client error (Connect)".to_string()],
+                ErrorKind::TcpFailure,
+            ),
+            (
+                "DNS 文本特征（getaddrinfo）",
+                false,
+                true,
+                false,
+                vec![
+                    "client error (Connect)".to_string(),
+                    "failed to lookup address information: No such host is known.".to_string(),
+                ],
+                ErrorKind::DnsFailure,
+            ),
+            (
+                "DNS 文本特征（no such host 小写）",
+                false,
+                true,
+                false,
+                vec!["error".to_string(), "dns error: no such host".to_string()],
+                ErrorKind::DnsFailure,
+            ),
+            (
+                "connect 无其它信号 → TLS 失败",
+                false,
+                true,
+                false,
+                vec!["unexpected EOF during handshake".to_string()],
+                ErrorKind::TlsFailure,
+            ),
+            (
+                "非 connect 非超时 → 明确 unknown",
+                false,
+                false,
+                false,
+                vec!["body decode error".to_string()],
+                ErrorKind::Unknown,
+            ),
+            (
+                "DNS 特征优先于拒连布尔（resolve 失败不误判 TCP）",
+                false,
+                true,
+                true,
+                vec!["failed to lookup address information".to_string()],
+                ErrorKind::DnsFailure,
+            ),
+        ];
+        for (name, is_timeout, is_connect, refused, chain, expected) in cases {
+            let kind = classify_from_chain(is_timeout, is_connect, refused, &chain);
+            assert_eq!(kind, expected, "用例 {name}");
+        }
+    }
+
+    #[test]
+    fn unknown_is_explicitly_allowed() {
+        let (is_timeout, is_connect, refused, chain) = {
+            // 构造一个非连接、非超时的 reqwest 错误（body 解码）不易直造；
+            // 直接验证纯函数对空信号的行为即可。
+            (false, false, false, vec!["whatever".to_string()])
+        };
+        assert_eq!(
+            classify_from_chain(is_timeout, is_connect, refused, &chain),
+            ErrorKind::Unknown
+        );
     }
 }

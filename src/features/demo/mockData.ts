@@ -5,6 +5,7 @@
  * 严禁在任何非演示路径渲染这些数据，更不得让它们看起来像真实测量结果。
  */
 import type {
+  Diagnosis,
   DiagnosticError,
   ProbeSample,
   RouteMode,
@@ -126,6 +127,35 @@ export const MOCK_RECENT_RUN = {
   target_count: 3,
   median_ms: 918,
 };
+
+
+/** Demo 诊断结论夹具：与演示测量数据对应的固定输出（引擎在真实模式才经 IPC 运行）。 */
+export const MOCK_DIAGNOSES: Diagnosis[] = [
+  {
+    rule_id: 'R04',
+    title: '目标 openai-api 的 HTTPS 请求超时（1/3）',
+    severity: 'warning',
+    confidence: 'possible',
+    observed_facts: ['3 次已执行的 HTTPS 采样中有 1 次未在限定时间内完成'],
+    possible_causes: ['网络路径丢包或拥塞导致响应缓慢', '目标服务响应缓慢（含 CDN/网关）'],
+    verification_steps: ['提高单请求超时后重测，观察是否完成', '对比其它目标的超时情况'],
+    limitations: ['不能定位丢包或拥塞发生的位置', '不能据此断言对方服务器宕机'],
+    related_target_ids: ['openai-api'],
+    related_probe_types: ['https'],
+  },
+  {
+    rule_id: 'R05',
+    title: '目标 claude 返回了 HTTP 401/403 响应',
+    severity: 'info',
+    confidence: 'evidence_sufficient',
+    observed_facts: ['1 个 HTTPS 采样收到了 401/403 状态码（网络与 TLS 均已完成）'],
+    possible_causes: ['目标对未携带凭证的请求返回的正常响应（本工具从不发送凭证）'],
+    verification_steps: ['用浏览器访问同一地址，对比响应状态（只读）'],
+    limitations: ['401/403 ≠ 服务不可用，也 ≠ 服务可用：只说明 HTTP 层可达且有响应', '不能据此推断账号能否正常登录或业务是否正常'],
+    related_target_ids: ['claude'],
+    related_probe_types: ['https'],
+  },
+];
 
 /** 总览迷你趋势图：近 5 次演示运行的 HTTPS 中位耗时（ms）。 */
 export const MOCK_TREND = [

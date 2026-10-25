@@ -16,6 +16,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
+import { DiagnosisList } from '@/components/diagnosis/DiagnosisList';
 import { useAppSettings } from '@/app/settings';
 import { normalizeIpcError, runDiagnostic, api, type DiagnosticRunSession } from '@/lib/api';
 import { fmtDurationMs, fmtPercent } from '@/lib/format';
@@ -32,13 +33,14 @@ import {
 } from '@/lib/types';
 import type {
   DiagnosticRequest,
+  Diagnosis,
   IpcError,
   ProbeSample,
   ProbeType,
   RouteMode,
 } from '@/lib/types';
 import { cn } from '@/lib/utils';
-import { buildDemoTargets } from '@/features/demo/mockData';
+import { buildDemoTargets, MOCK_DIAGNOSES } from '@/features/demo/mockData';
 
 /** 镜像 Rust security::validation 的手动代理校验规则（展示层预检，后端仍二次校验）。 */
 export function validateProxyUrl(raw: string): string | null {
@@ -151,6 +153,7 @@ export function DiagnosticsPage() {
   const [runState, setRunState] = useState<RunState>('idle');
   const [percent, setPercent] = useState(0);
   const [resultSamples, setResultSamples] = useState<ProbeSample[]>([]);
+  const [diagnoses, setDiagnoses] = useState<Diagnosis[] | null>(null);
   const [ipcError, setIpcError] = useState<IpcError | null>(null);
   const demoTimerRef = useRef<number | null>(null);
   const sessionRef = useRef<DiagnosticRunSession | null>(null);
@@ -186,6 +189,7 @@ export function DiagnosticsPage() {
     const flat = plan.flatMap((target) => target.samples);
     setResultSamples([]);
     setIpcError(null);
+    setDiagnoses(null);
     setPercent(0);
     setRunState('running');
     let index = 0;
@@ -195,6 +199,7 @@ export function DiagnosticsPage() {
       setPercent(Math.round((index / flat.length) * 100));
       if (index >= flat.length) {
         setRunState('completed');
+        setDiagnoses(MOCK_DIAGNOSES);
         demoTimerRef.current = null;
       } else {
         demoTimerRef.current = window.setTimeout(tick, 450);
@@ -208,6 +213,7 @@ export function DiagnosticsPage() {
   const startRealRun = async (): Promise<void> => {
     setIpcError(null);
     setResultSamples([]);
+    setDiagnoses(null);
     setPercent(0);
     setRunState('running');
     const request: DiagnosticRequest = {
@@ -233,6 +239,11 @@ export function DiagnosticsPage() {
           setRunState(
             run.status === 'cancelled' ? 'cancelled' : 'completed',
           );
+          // 规则诊断（纯函数 IPC，无网络）。
+          api
+            .diagnoseRuns([run])
+            .then((items) => setDiagnoses(items))
+            .catch(() => setDiagnoses(null));
         },
         onFailed: ({ error }) => {
           sessionRef.current?.unsubscribe();
@@ -534,6 +545,10 @@ export function DiagnosticsPage() {
                 ) : null}
               </CardContent>
             </Card>
+          ) : null}
+
+          {diagnoses && runState !== 'running' ? (
+            <DiagnosisList diagnoses={diagnoses} isDemo={demoMode} />
           ) : null}
         </div>
       </div>

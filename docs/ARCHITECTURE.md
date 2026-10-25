@@ -49,7 +49,7 @@ src-tauri/src/
     dns.rs                    # 独立 DNS 查询测量（标准解析器）
     tcp.rs                    # 独立 TCP connect 测量
     https.rs                  # Reqwest HTTPS 请求（三种路由模式、受限重定向/体积）
-    rules.rs                  # 规则诊断引擎（Phase 4，数据驱动、纯离线）
+    rules.rs                  # 规则诊断引擎（Phase 4，纯函数：diagnose(runs)→Vec<Diagnosis>，R01..R12）
   platform/windows/
     proxy.rs                  # 只读读取用户级 WinHTTP/注册表代理与 PAC 状态（Phase 3）
     network.rs                # 适配器/DNS 摘要（合法只读 API）
@@ -247,16 +247,28 @@ struct ProxySnapshot { user_proxy: UserProxyInfo, env_vars: Vec<EnvVarInfo>, cap
 
 | mode | 行为 | 必须展示的说明 |
 |---|---|---|
-| `library_default` | Reqwest 0.12.28 默认（`system-proxy` 特性默认启用）。**优先级链（源码实证 + mock 实测，D-019）**：`HTTPS_PROXY`/`HTTP_PROXY` > `ALL_PROXY` > 注册表 `ProxyServer`（需 `ProxyEnable=1`）；绕行：`NO_PROXY` env 优先，未设时用注册表 `ProxyOverride`（两槽位独立）；CGI 环境（`REQUEST_METHOD` 存在）env 全失效；**PAC 不参与** | 不保证与任何特定桌面应用行为一致；本机系统代理（如 Clash）的例外列表会直接影响它 |
+| `library_default` | Reqwest 0.12.28 默认（`system-proxy` 特性默认启用）。**优先级链（源码实证 + mock 实测，D-019）**：`HTTPS_PROXY`/`HTTP_PROXY` > `ALL_PROXY` > 注册表 `ProxyServer`（需 `ProxyEnable=1`）；绕行：`NO_PROXY` env 优先，未设时用注册表 `ProxyOverride`（两槽位独立）；CGI 环境（`REQUEST_METHOD` 存在）env 全失效；**PAC 不参与** | **结论限定范围（D-019）**：仅适用于当前锁定的 reqwest 0.12.28 + hyper-util 0.1.21 与已验证环境（Windows 11 23H2 + Clash 系系统代理），不得泛化为所有 Windows 环境或其它 reqwest 版本；升级依赖必须复测。也不保证与任何特定桌面应用行为一致 |
 | `no_app_proxy` | 构建客户端时显式 `no_proxy()` | 仅指不使用应用层显式代理；TUN/透明代理仍可能生效；**绝不声称"未经过代理"** |
 | `manual_local_proxy` | 仅 HTTPS 走用户指定 loopback 代理 | 仅接受 `http://`、`socks5://`、`socks5h://`（socks5=本地解析域名，socks5h=由代理解析域名，差异须展示）；代理失败 → `proxy_unavailable`，**绝不静默回落**；DNS/TCP 显示"不适用（独立基线）" |
 
 ### 7.3 请求策略
 - 方法：HEAD 优先；405 时允许**一次** GET 回退，响应体读取上限 64 KiB 后丢弃。
 - 重定向：最多 5 次；到达上限仍 3xx → `redirect_3xx`。
-- 超时：单请求 `timeout_ms`（≤10s）；任务全局截止 120s；HTTPS 并发 ≤3；重试：无（`.retry(never())` 显式禁用 reqwest 默认 h2/h3 NACK 重试，D-018）。
+- 超时：单请求 `timeout_ms`（≤10s）；任务全局截止 120s；HTTPS 并发 ≤3。
+- 重试语义（D-018 措辞澄清）：`.retry(never())` 禁止的是**隐式传输层重试**（同一次采样内静默重发请求，包括 reqwest 默认的 h2/h3 协议 NACK 重发）；**协议内的合法行为不属于重试**——按白名单规则跟随 HTTP 3xx 重定向（最多 5 次，每次是新的合法请求）与 HEAD 被拒后的一次 GET 回退（显式策略、可观测、计入采样事实）均被允许。同一采样绝不静默产生第二次传输尝试（测试守护：服务端立即断开 → 只看到 1 次连接）。
 - 取消：`CancellationToken`，取消后未完成样本记 `cancelled`，已落库数据不回填、不伪造。
 - manual_local_proxy 不可达：`proxy_unavailable`（含代理 407 / SOCKS 连接失败），绝不回落直连（D-005，mock 实测守护）。
+
+### 7.5 规则诊断引擎（Phase 4，D-020）
+- `rules.rs::diagnose(runs)`：纯函数，输入 1..16 个运行结果，输出确定性诊断列表。
+- 规则清单：R01 DNS 失败 / R02 TCP 失败 / R03 TLS 失败 / R04 HTTPS 超时 / R05 401·403（中性）/
+  R06 407 / R07 429 / R08 5xx / R09 指定代理不可用（模式门控） / R10 跨路径不一致（跨运行） /
+  R11 基线正常但 HTTPS 全失败 / R12 样本不足或取消（insufficient）。
+- 置信分层：全部执行且一致失败 → evidence_sufficient；部分失败/跨路径差异 → possible；
+  取消/样本不足 → insufficient。事实（observed_facts）只引用测量；解释（possible_causes）≤3；
+  每条必附 limitations。禁止断言（信誉/封锁/绕过/登录/节点更快/宕机）由测试扫描守护。
+- IPC：`diagnose_runs(runs) -> Vec<Diagnosis>`（白名单命令，无网络）。前端结论卡仅排序、
+  去重与展示；空结果不渲染。
 
 ### 7.4 Windows 代理配置快照（Phase 3）
 三来源分别检测、分别标注（`platform/windows/proxy.rs`，全部只读 API）：

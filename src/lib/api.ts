@@ -14,6 +14,8 @@ import type {
   IpcError,
   IpcErrorCode,
   JobHandle,
+  DiagnosticRun,
+  Diagnosis,
   ProgressPayload,
   SystemSnapshot,
 } from './types';
@@ -64,6 +66,10 @@ export const api = {
   /** Windows 代理配置只读快照（Phase 3：三来源分别标注，全量脱敏，纯本地读取）。 */
   getProxySnapshot: (): Promise<ProxySnapshot> =>
     callIpc<ProxySnapshot>('get_proxy_snapshot'),
+
+  /** 规则诊断（Phase 4：纯函数、离线、确定性；输入为已持有的运行结果）。 */
+  diagnoseRuns: (runs: DiagnosticRun[]): Promise<Diagnosis[]> =>
+    callIpc<Diagnosis[]>('diagnose_runs', { runs }),
 
   /** 启动诊断（低层句柄：一般应使用 runDiagnostic 以获得事件流）。 */
   startDiagnostic: (request: DiagnosticRequest): Promise<JobHandle> =>

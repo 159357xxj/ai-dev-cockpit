@@ -6,9 +6,10 @@ use tauri::{AppHandle, Emitter as _, State};
 
 use crate::AppState;
 use crate::diagnostic::backend::{JobContext, ProbeBackend};
+use crate::diagnostic::rules::{Diagnosis, diagnose};
 use crate::diagnostic::scheduler::Emitter;
 use crate::diagnostic::types::{
-    CancelOutcome, DiagnosticRequest, IpcError, JobEvent, JobHandle, RouteMode,
+    CancelOutcome, DiagnosticRequest, DiagnosticRun, IpcError, JobEvent, JobHandle, RouteMode,
 };
 use crate::security::validation::validate_manual_proxy_url;
 
@@ -61,6 +62,16 @@ pub fn start_diagnostic_impl(
         validate_manual_proxy_url(raw).map_err(IpcError::invalid_input)?;
     }
     backend.start_job(request, JobContext { emit: emitter })
+}
+
+/// 规则诊断：对一至多个已完成/已取消的运行求值（纯函数、离线、确定性，
+/// 无网络请求、无 AI 服务）。输入来自前端已持有的运行结果。
+#[tauri::command(rename_all = "snake_case")]
+pub fn diagnose_runs(runs: Vec<DiagnosticRun>) -> Result<Vec<Diagnosis>, IpcError> {
+    if runs.len() > 16 {
+        return Err(IpcError::invalid_input("单次诊断最多支持 16 个运行"));
+    }
+    Ok(diagnose(&runs))
 }
 
 /// 取消诊断任务（幂等）。

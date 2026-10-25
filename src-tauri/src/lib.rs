@@ -37,6 +37,7 @@ pub fn run() {
             commands::system::get_proxy_snapshot,
             commands::diagnostics::start_diagnostic,
             commands::diagnostics::cancel_diagnostic,
+            commands::diagnostics::diagnose_runs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

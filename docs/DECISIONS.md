@@ -112,6 +112,7 @@
 - 背景：审计发现锁定的 reqwest 0.12.28 默认把客户端包进 `tower::retry::Retry`（`Builder::default()` → `Classifier::ProtocolNacks`），对 **HTTP/2/3 协议层 NACK**（`h2::Error` 的 REFUSED_STREAM/GOAWAY 等）会静默重发请求——与"一次采样 = 恰好一次请求"契约冲突（http2 为默认特性）。
 - 决定：所有模式的客户端显式 `.retry(reqwest::retry::never())`（reqwest 官方 API，文档原文"disable the Client's default behavior of retrying protocol nacks"）；连接错误/超时/HTTP 状态码本就不在默认重试范围（源码 `is_retryable_error` 仅匹配 h2/h3 错误）。测试以"mock 立即断开 → 服务端只看到 1 次连接"守护。
 - 后果：采样语义严格；若未来升级 reqwest 需复查该默认值（风险登记表持续跟踪）。
+- **措辞澄清（Phase 4 补强）**：`never()` 禁止的是隐式传输层重试；按白名单规则跟随 3xx 重定向与 HEAD→GET 一次性回退是显式策略下的**新请求**，不属于重试范畴。
 
 ## D-019 Windows 代理快照来源与 library_default 语义（Phase 3，源码实证 + 实测）
 - 决定：
@@ -119,6 +120,17 @@
   2. `library_default` 的实际代理解析链（reqwest 0.12.28 → hyper-util 0.1.21 `Matcher::from_system`，源码实证 + 本机 mock 实测）：**`HTTPS_PROXY`/`HTTP_PROXY` > `ALL_PROXY` > 注册表 `ProxyServer`（需 `ProxyEnable=1`）**；绕行列表：**`NO_PROXY` 环境变量优先，未设时用注册表 `ProxyOverride`**（两槽位独立！）；`REQUEST_METHOD` 存在（CGI）时 env 代理全部失效；**PAC/AutoConfigURL 完全不参与**。
   3. 本机实测：系统代理开启（Clash 系 127.0.0.1:7890）且 `ProxyOverride` 含 `127.*` 时，library_default 对 127.0.0.1 目标即使设置了 `HTTPS_PROXY` 也直连（`no` 槽位被注册表例外占据）——该行为已固化为条件执行的观测测试。
 - 后果：ARCHITECTURE §7.2 已固化；`no_app_proxy` 不受 env/注册表影响的反向证明完成。
+- **范围限定（Phase 4 补强）**：上述优先级链结论仅对**当前锁定版本**（reqwest 0.12.28 + hyper-util 0.1.21）与**已验证环境**（Windows 11 23H2 + Clash 系系统代理 + 本注册表状态）成立；不得泛化为所有 Windows 环境或未来版本，依赖升级必须重新实测。
+
+## D-020 规则诊断引擎：纯函数、证据分层、确定性（Phase 4）
+- 背景：PRD P4 要求"可解释、确定性、离线"的诊断建议，禁止 AI/云端；建议必须区分事实与推断。
+- 决定：
+  1. `diagnostic/rules.rs` 为**纯函数引擎**（`diagnose(&[DiagnosticRun]) -> Vec<Diagnosis>`）：只消费结构化测量结果，无网络、无状态、无随机数，同输入必同输出（测试断言字节级一致）；
+  2. 每条诊断七段式：rule_id / title / severity（info|warning|critical）/ **confidence（evidence_sufficient|possible|insufficient，仅证据充分程度，非根因概率）** / observed_facts（仅引用测量） / possible_causes（≤3 条解释）/ verification_steps（优先只读）+ limitations（不可推断事项）；
+  3. 12 条核心规则 R01..R12 按固定顺序求值，target 字典序，输出按 rule_id 排序；每 (规则, 目标) 至多一条，任务级规则每任务至多一条；
+  4. 取消样本不触发任何传输失败规则（D-014 延续）；传输失败与 HTTP 非 2xx 分口径；R10/R11 明确"独立测量不强行归因"；R12 用 insufficient 表达"样本不支持结论"；
+  5. 禁止断言（IP 信誉/ISP 封锁/TUN 绕过/账号可登录/节点必然更快/服务器宕机）由**测试扫描**守护：标题与 possible_causes 中出现即失败（为此规则文案避免使用这些词的否定句式）。
+- 后果：IPC 新增 `diagnose_runs(runs) -> Vec<Diagnosis>`（纯函数、限 16 运行）；前端结论卡只做展示与排序去重；TS DTO 同步（types.ts Diagnosis/Severity/Confidence）。
 
 ## 变更流程
 新决策追加新编号条目（如 D-011）；推翻旧决策时新条目标注"替代 D-xxx"，旧条目状态改为"已替代（见 D-xxx）"。

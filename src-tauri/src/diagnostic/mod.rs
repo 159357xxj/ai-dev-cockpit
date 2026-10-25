@@ -3,6 +3,7 @@
 pub mod backend;
 pub mod dns;
 pub mod https;
+pub mod rules;
 pub mod scheduler;
 pub mod targets;
 pub mod tcp;

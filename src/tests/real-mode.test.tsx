@@ -16,6 +16,8 @@ import { createAppRouter } from '@/app/router';
 const cancelMock = vi.fn();
 let capturedHandlers: DiagnosticRunHandlers | null = null;
 
+const diagnoseRunsMock = vi.fn();
+
 vi.mock('@/lib/api', () => ({
   runDiagnostic: vi.fn((_request: unknown, handlers: DiagnosticRunHandlers) => {
     capturedHandlers = handlers;
@@ -23,7 +25,10 @@ vi.mock('@/lib/api', () => ({
   }),
   cancelDiagnostic: (...args: unknown[]) => cancelMock(...args),
   normalizeIpcError: (raw: unknown) => raw as { code: string; message: string },
-  api: { cancelDiagnostic: (...args: unknown[]) => cancelMock(...args) },
+  api: {
+    cancelDiagnostic: (...args: unknown[]) => cancelMock(...args),
+    diagnoseRuns: (...args: unknown[]) => diagnoseRunsMock(...args),
+  },
 }));
 
 function renderDiagnostics(): void {
@@ -82,6 +87,8 @@ beforeEach(() => {
   );
   capturedHandlers = null;
   cancelMock.mockReset();
+  diagnoseRunsMock.mockReset();
+  diagnoseRunsMock.mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -112,6 +119,10 @@ describe('真实模式诊断页', () => {
     expect(await screen.findByText('已完成')).toBeInTheDocument();
     expect(screen.getByText('收到响应（403）')).toBeInTheDocument();
     expect(screen.getByText(/非2xx 50%/)).toBeInTheDocument();
+    // 终态后必须请求规则诊断（纯函数 IPC，输入为该 run）
+    await vi.waitFor(() => expect(diagnoseRunsMock).toHaveBeenCalledTimes(1));
+    const runsArg = diagnoseRunsMock.mock.calls[0][0] as Array<{ run_id: string }>;
+    expect(runsArg[0].run_id).toBe('run-1');
     // 真实模式绝不出现演示标识。
     expect(screen.queryAllByText('演示数据')).toHaveLength(0);
   });

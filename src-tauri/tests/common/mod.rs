@@ -301,3 +301,5 @@ async fn write_ok(stream: &mut TcpStream, bytes: &[u8], total_written: &Arc<Atom
 }
 
 pub mod proxy_mock;
+
+pub mod tls_mock;

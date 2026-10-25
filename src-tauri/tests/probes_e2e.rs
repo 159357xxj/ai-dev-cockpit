@@ -44,6 +44,7 @@ fn https_params(server: &MockServer, path: &str, timeout: Duration) -> HttpsProb
         route_mode: RouteMode::NoAppProxy,
         manual_proxy_url: None,
         timeout,
+        additional_trusted_root_der: None,
         rules: rules_for(server),
     }
 }
@@ -271,6 +272,7 @@ async fn tls_handshake_against_plain_server_is_tls_failure() {
         route_mode: RouteMode::NoAppProxy,
         manual_proxy_url: None,
         timeout: Duration::from_secs(5),
+        additional_trusted_root_der: None,
         rules: rules_for(&server),
     };
     let sample = probe_https(&params, CancellationToken::new()).await;

@@ -246,6 +246,8 @@ pub async fn execute_job(
                     manual_proxy_url: spec.request.manual_local_proxy_url.clone(),
                     timeout: per_request_timeout,
                     rules: spec.redirect_rules.clone(),
+                    // 生产恒为 None：不向信任库注入任何非系统根。
+                    additional_trusted_root_der: None,
                 };
                 attempts.spawn(async move {
                     // 取消与信号量等待竞争：取消时未开始的任务不产生样本（未执行 ≠ 取消）。

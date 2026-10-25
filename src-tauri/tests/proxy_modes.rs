@@ -12,6 +12,8 @@
 
 mod common;
 
+use common::tls_mock::MockTlsServer;
+
 use std::time::Duration;
 
 use ai_dev_cockpit_lib::diagnostic::https::{HttpsProbeParams, RedirectRules, probe_https};
@@ -59,6 +61,21 @@ fn params(
         manual_proxy_url: manual_proxy,
         timeout,
         rules,
+        additional_trusted_root_der: None,
+    }
+}
+
+fn params_with_root(
+    target_url: String,
+    route_mode: RouteMode,
+    manual_proxy: Option<String>,
+    timeout: Duration,
+    rules: RedirectRules,
+    root_der: Vec<u8>,
+) -> HttpsProbeParams {
+    HttpsProbeParams {
+        additional_trusted_root_der: Some(root_der),
+        ..params(target_url, route_mode, manual_proxy, timeout, rules)
     }
 }
 
@@ -409,4 +426,86 @@ async fn library_default_honours_system_proxy_override_registry() {
     );
     proxy.shutdown().await;
     target.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 补强 2：CONNECT → TLS → 200 完整成功路径（测试专用受信证书）
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn manual_https_proxy_full_tls_success_with_trusted_test_cert() {
+    // 完整链路：HTTP 代理 CONNECT → TLS 握手（证书校验开启）→ 200。
+    // 测试 CA 通过 additional_trusted_root_der 注入信任库——生产校验逻辑未关闭。
+    let tls = MockTlsServer::spawn().await.expect("TLS mock 启动");
+    let proxy = MockHttpProxy::spawn(HttpProxyMode::TunnelTo {
+        target_port: tls.port,
+    })
+    .await;
+
+    let sample = run(&params_with_root(
+        tls.url("/status/200"),
+        RouteMode::ManualLocalProxy,
+        Some(format!("http://127.0.0.1:{}", proxy.port)),
+        Duration::from_secs(5),
+        rules_any_http(tls.port),
+        tls.root_cert_der.clone(),
+    ))
+    .await;
+
+    assert!(proxy.connect_seen(), "CONNECT 隧道应建立");
+    assert!(
+        sample.success,
+        "经代理的完整 TLS 事务应成功：{:?}",
+        sample.error
+    );
+    assert_eq!(sample.http_status, Some(200));
+    assert_eq!(
+        sample.http_outcome,
+        Some(ai_dev_cockpit_lib::diagnostic::types::HttpOutcome::Ok2xx)
+    );
+    assert!(
+        sample.duration_ms.is_some(),
+        "成功事务保留真实耗时（D-017）"
+    );
+    proxy.shutdown().await;
+    tls.shutdown().await;
+}
+
+#[tokio::test]
+async fn no_app_proxy_tls_direct_success_with_trusted_test_cert() {
+    // 无代理直连 TLS：同受信根，验证非代理路径的完整成功。
+    let tls = MockTlsServer::spawn().await.expect("TLS mock 启动");
+    let sample = run(&params_with_root(
+        tls.url("/status/200"),
+        RouteMode::NoAppProxy,
+        None,
+        Duration::from_secs(5),
+        rules_any_http(tls.port),
+        tls.root_cert_der.clone(),
+    ))
+    .await;
+    assert!(sample.success, "直连 TLS 应成功：{:?}", sample.error);
+    assert_eq!(sample.http_status, Some(200));
+    tls.shutdown().await;
+}
+
+#[tokio::test]
+async fn tls_validation_still_rejects_without_trusted_root() {
+    // 负向守护：不注入测试根时，自签名证书必须被正常校验拒绝——
+    // 证明成功测试来自"扩展信任库"而非"关闭校验"。
+    let tls = MockTlsServer::spawn().await.expect("TLS mock 启动");
+    let sample = run(&params(
+        tls.url("/status/200"),
+        RouteMode::NoAppProxy,
+        None,
+        Duration::from_secs(5),
+        rules_any_http(tls.port),
+    ))
+    .await;
+    assert!(!sample.success, "不受信任的证书必须被拒绝");
+    assert_eq!(
+        sample.error.as_ref().map(|error| error.kind),
+        Some(ErrorKind::TlsFailure)
+    );
+    tls.shutdown().await;
 }

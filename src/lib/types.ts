@@ -176,6 +176,25 @@ export interface ProxySnapshot {
   note: string;
 }
 
+/** 规则诊断结论（Phase 4，Rust rules.rs 一一对应）。 */
+export type Severity = 'info' | 'warning' | 'critical';
+
+/** 证据充分程度——不是根因概率。 */
+export type Confidence = 'evidence_sufficient' | 'possible' | 'insufficient';
+
+export interface Diagnosis {
+  rule_id: string;
+  title: string;
+  severity: Severity;
+  confidence: Confidence;
+  observed_facts: string[];
+  possible_causes: string[];
+  verification_steps: string[];
+  limitations: string[];
+  related_target_ids: string[];
+  related_probe_types: ProbeType[];
+}
+
 export interface AdapterSummary {
   name: string;
   adapter_type: string | null;

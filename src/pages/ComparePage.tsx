@@ -16,6 +16,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select } from '@/components/ui/select';
+import { DiagnosisList } from '@/components/diagnosis/DiagnosisList';
 import { useAppSettings } from '@/app/settings';
 import { api, normalizeIpcError, runDiagnostic, type DiagnosticRunSession } from '@/lib/api';
 import { fmtDurationMs, fmtPercent, fmtUtcToLocal } from '@/lib/format';
@@ -29,9 +30,15 @@ import {
   TIMEOUT_MAX_MS,
   TIMEOUT_MIN_MS,
 } from '@/lib/types';
-import type { DiagnosticRun, IpcError, ProbeSample, RouteMode } from '@/lib/types';
+import type {
+  Diagnosis,
+  DiagnosticRun,
+  IpcError,
+  ProbeSample,
+  RouteMode,
+} from '@/lib/types';
 import { cn } from '@/lib/utils';
-import { buildDemoCompare } from '@/features/demo/mockData';
+import { buildDemoCompare, MOCK_DIAGNOSES } from '@/features/demo/mockData';
 
 /** 对比中每个模式的执行状态。 */
 interface ModeRunState {
@@ -68,6 +75,7 @@ export function ComparePage() {
   const [runningMode, setRunningMode] = useState<RouteMode | null>(null);
   const [batch, setBatch] = useState(0);
   const [modeStates, setModeStates] = useState<Record<string, ModeRunState>>({});
+  const [diagnoses, setDiagnoses] = useState<Diagnosis[] | null>(null);
   const sessionRef = useRef<DiagnosticRunSession | null>(null);
   const batchRef = useRef(0);
 
@@ -132,6 +140,7 @@ export function ComparePage() {
     if (problem) return;
     if (demoMode) return; // 演示数据为静态展示，无需执行
 
+    setDiagnoses(null);
     const currentBatch = batch + 1;
     setBatch(currentBatch);
     batchRef.current = currentBatch;
@@ -216,6 +225,19 @@ export function ComparePage() {
       }
     }
     setRunningMode(null);
+
+    // 批次结束：对已完成的运行请求规则诊断（纯函数 IPC；失败则不出卡片，不伪造）。
+    const finished = Object.values(modeStatesRef.current)
+      .filter((state) => state.batch === currentBatch && state.run !== null)
+      .map((state) => state.run as DiagnosticRun);
+    if (finished.length > 0) {
+      api
+        .diagnoseRuns(finished)
+        .then((items) => setDiagnoses(items))
+        .catch(() => setDiagnoses(null));
+    } else {
+      setDiagnoses(null);
+    }
   };
 
   /** 等待指定模式的终态（轮询状态，终态由事件回调写入）。 */
@@ -433,6 +455,9 @@ export function ComparePage() {
               </CardContent>
             </Card>
           ) : null}
+
+          {demoMode ? <DiagnosisList diagnoses={MOCK_DIAGNOSES} isDemo /> : null}
+          {!demoMode && diagnoses ? <DiagnosisList diagnoses={diagnoses} /> : null}
 
           <Card>
             <CardHeader>
