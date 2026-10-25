@@ -17,7 +17,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::types::{DiagnosticRun, ErrorKind, HttpOutcome, ProbeSample, ProbeType, RunStatus};
+use super::types::{
+    DiagnosticRun, ErrorKind, HttpOutcome, ProbeSample, ProbeType, RouteMode, RunStatus,
+};
 
 // ---------------------------------------------------------------------------
 // DTO（与前端 types.ts 一一对应，snake_case 线上格式）
@@ -154,14 +156,6 @@ impl<'a> TargetView<'a> {
             .collect()
     }
 
-    fn https_successes(&self) -> Vec<&'a ProbeSample> {
-        self.https
-            .iter()
-            .copied()
-            .filter(|sample| sample.success)
-            .collect()
-    }
-
     fn dns_all_failed(&self) -> bool {
         !self.dns.is_empty() && self.dns.iter().all(|sample| !sample.success)
     }
@@ -185,6 +179,15 @@ fn partial_aware_confidence(failed: usize, executed: usize) -> Confidence {
         Confidence::EvidenceSufficient
     } else {
         Confidence::Possible
+    }
+}
+
+/// 路由模式的中文标签（与前端 ROUTE_MODE_LABELS 一致）。
+fn route_mode_label(mode: RouteMode) -> &'static str {
+    match mode {
+        RouteMode::LibraryDefault => "库默认（library_default）",
+        RouteMode::NoAppProxy => "无应用代理（no_app_proxy）",
+        RouteMode::ManualLocalProxy => "手动本地代理（manual_local_proxy）",
     }
 }
 
@@ -668,9 +671,13 @@ fn rule_r10_cross_mode_divergence(runs: &[DiagnosticRun], out: &mut Vec<Diagnosi
     if runs.len() < 2 {
         return;
     }
-    // 目标 → (模式标签, 成功数, 执行数)。BTreeMap 保证确定性。
-    let mut per_target: BTreeMap<String, Vec<(String, u32, u32)>> = BTreeMap::new();
+    // 目标 → (模式, 成功数, 传输失败数, 执行数)。BTreeMap 保证确定性。
+    let mut per_target: BTreeMap<String, Vec<(RouteMode, u32, u32, u32)>> = BTreeMap::new();
     for run in runs {
+        // 取消任务不参与路径一致性判断（结果不完整）。
+        if run.status != RunStatus::Completed {
+            continue;
+        }
         for target in &run.targets {
             let Some(aggregate) = target
                 .aggregates
@@ -679,16 +686,13 @@ fn rule_r10_cross_mode_divergence(runs: &[DiagnosticRun], out: &mut Vec<Diagnosi
             else {
                 continue;
             };
-            // 取消任务不参与路径一致性判断（结果不完整）。
-            if run.status != RunStatus::Completed {
-                continue;
-            }
             per_target
                 .entry(target.target_id.clone())
                 .or_default()
                 .push((
-                    format!("{:?}", run.route_mode),
+                    run.route_mode,
                     aggregate.success_count,
+                    aggregate.transport_failure_count,
                     aggregate.executed_total(),
                 ));
         }
@@ -698,19 +702,36 @@ fn rule_r10_cross_mode_divergence(runs: &[DiagnosticRun], out: &mut Vec<Diagnosi
         if entries.len() < 2 {
             continue;
         }
-        // 触发条件（确定性）：某模式全部成功，而另一模式存在传输失败。
+        // 参与比较的运行必须覆盖至少两种不同 route_mode：
+        // 相同模式的不同运行（如重复测量）不构成"跨路径"差异。
+        let has_two_modes = entries
+            .iter()
+            .any(|(mode, ..)| entries.iter().any(|(other, ..)| other != mode));
+        if !has_two_modes {
+            continue;
+        }
+        // 触发条件（专项修复，基于 transport_failure_count 区分口径）：
+        // 某模式全部成功（executed>0 且 success==executed），而另一模式存在
+        // **真实传输失败**（未收到任何 HTTP 响应）。非 2xx 响应是"收到了响应"
+        // （D-007/D-011），不计入传输失败，也不触发本规则。
         let all_success_somewhere = entries
             .iter()
-            .any(|(_, success, executed)| *executed > 0 && success == executed);
-        let transport_failure_somewhere = entries
-            .iter()
-            .any(|(_, success, executed)| executed > success);
+            .any(|(_, success, _, executed)| *executed > 0 && success == executed);
+        let transport_failure_somewhere = entries.iter().any(|(_, _, failures, _)| *failures > 0);
         if !(all_success_somewhere && transport_failure_somewhere) {
             continue;
         }
         let facts: Vec<String> = entries
             .iter()
-            .map(|(mode, success, executed)| format!("模式 {mode}：{success}/{executed} 成功"))
+            .map(|(mode, success, failures, executed)| {
+                format!(
+                    "模式 {}：{}/{} 成功，传输失败 {}",
+                    route_mode_label(*mode),
+                    success,
+                    executed,
+                    failures
+                )
+            })
             .collect();
         push(
             out,
@@ -753,13 +774,16 @@ fn rule_r11_baseline_https_divergence(
         return;
     }
     let transport_failures = view.https_transport_failures();
-    if transport_failures.is_empty() || !view.https_successes().is_empty() {
-        // 存在成功样本或没有传输失败：不构成"基线正常但 HTTPS 全失败"。
-        return;
-    }
     let executed = view.https_aggregate.map_or(view.https.len(), |aggregate| {
         aggregate.executed_total() as usize
     });
+    // 触发条件（专项修复）：基线正常，且**全部已执行样本都是传输失败**——
+    // 即没有任何样本收到 HTTP 响应（含非 2xx）。只要存在收到响应的样本
+    // （200 或 401/403/5xx），"均未获得 HTTP 响应"的结论就不成立，
+    // 非 2xx 事实由 R05/R07/R08 等响应类规则覆盖（D-007/D-011/D-017）。
+    if executed == 0 || transport_failures.len() != executed {
+        return;
+    }
     push(
         out,
         Diagnosis {
@@ -772,7 +796,7 @@ fn rule_r11_baseline_https_divergence(
                     "独立基线：DNS 解析成功、TCP 443 建连成功（{} 次测量）",
                     view.tcp.len()
                 ),
-                format!("{executed} 次 HTTPS 采样均未获得 HTTP 响应"),
+                format!("{executed} 次 HTTPS 采样均未获得 HTTP 响应（全部为传输层失败）"),
             ],
             possible_causes: vec![
                 "TLS 层在该路径上被干扰或阻断".to_string(),

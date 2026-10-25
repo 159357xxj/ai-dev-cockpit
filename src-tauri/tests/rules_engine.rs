@@ -52,7 +52,8 @@ fn transport(mut sample: ProbeSample, kind: ErrorKind) -> ProbeSample {
 
 fn status_sample(mut sample: ProbeSample, status: u16) -> ProbeSample {
     sample.success = (200..300).contains(&status);
-    sample.duration_ms = if sample.success { Some(400) } else { None };
+    // D-017：收到 HTTP 响应（含非 2xx）即完成事务，保留真实耗时。
+    sample.duration_ms = Some(400);
     sample.http_status = Some(status);
     sample.http_outcome = Some(match status {
         200..=299 => HttpOutcome::Ok2xx,
@@ -723,5 +724,153 @@ fn confidence_serializes_as_evidence_level_not_probability() {
     assert_eq!(
         serde_json::to_string(&Confidence::Insufficient).unwrap(),
         "\"insufficient\""
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 专项修复回归（Phase 5 前置）：R11 混合结果误判 / R10 路径对比语义
+// ---------------------------------------------------------------------------
+
+#[test]
+fn regression_r11_all_403_responses_do_not_fire() {
+    // 全部样本收到 403：是"收到响应"，绝不是"全部未获得响应"。
+    let run = run_with_https(
+        RouteMode::NoAppProxy,
+        vec![
+            status_sample(https(1), 403),
+            status_sample(https(2), 403),
+            status_sample(https(3), 403),
+        ],
+    );
+    let out = diagnose(&[run]);
+    assert!(
+        find_rule(&out, "R11").is_none(),
+        "全部收到 403 响应不得触发 R11（非传输失败）"
+    );
+    assert!(find_rule(&out, "R05").is_some(), "403 应由 R05 中性覆盖");
+}
+
+#[test]
+fn regression_r11_mixed_403_and_tls_failure_must_not_claim_all_failed() {
+    // 混合：2×403（收到响应）+ 1×TLS 失败（传输失败）。
+    let run = run_with_https(
+        RouteMode::NoAppProxy,
+        vec![
+            status_sample(https(1), 403),
+            status_sample(https(2), 403),
+            transport(https(3), ErrorKind::TlsFailure),
+        ],
+    );
+    let out = diagnose(&[run]);
+    assert!(
+        find_rule(&out, "R11").is_none(),
+        "存在收到响应的样本时，不得声称「均未获得 HTTP 响应」"
+    );
+    // 两类事实仍须各自如实报告。
+    assert!(find_rule(&out, "R03").is_some(), "TLS 失败仍应单独报告");
+    assert!(find_rule(&out, "R05").is_some(), "403 响应仍应中性报告");
+}
+
+#[test]
+fn regression_r11_all_transport_failures_still_fires() {
+    // 修复不得破坏原有触发：基线正常 + 全部传输失败 → R11 正常触发。
+    let run = run_with_https(
+        RouteMode::NoAppProxy,
+        vec![transport(https(1), ErrorKind::TlsFailure); 3],
+    );
+    let out = diagnose(&[run]);
+    let r11 = find_rule(&out, "R11").expect("全部传输失败应触发 R11");
+    assert!(
+        r11.observed_facts
+            .iter()
+            .any(|fact| fact.contains("均未获得 HTTP 响应"))
+    );
+}
+
+#[test]
+fn regression_r11_200_plus_tls_not_all_failed() {
+    let run = run_with_https(
+        RouteMode::NoAppProxy,
+        vec![
+            ok_sample(https(1), 400),
+            transport(https(2), ErrorKind::TlsFailure),
+            ok_sample(https(3), 400),
+        ],
+    );
+    assert!(find_rule(&diagnose(&[run]), "R11").is_none());
+}
+
+#[test]
+fn regression_r10_requires_two_distinct_route_modes() {
+    // 相同模式（均为 no_app_proxy）的两个运行：结果不同也不构成"跨路径"差异。
+    let good = run_with_https(
+        RouteMode::NoAppProxy,
+        vec![
+            ok_sample(https(1), 400),
+            ok_sample(https(2), 400),
+            ok_sample(https(3), 400),
+        ],
+    );
+    let bad = run_with_https(
+        RouteMode::NoAppProxy,
+        vec![transport(https(1), ErrorKind::Timeout); 3],
+    );
+    let out = diagnose(&[good, bad]);
+    assert!(
+        find_rule(&out, "R10").is_none(),
+        "相同 route_mode 的运行不参与跨路径比较"
+    );
+}
+
+#[test]
+fn regression_r10_non_2xx_responses_are_not_transport_failures() {
+    // 路径 A 全 200；路径 B 全 403（收到了响应，只是状态码非 2xx）。
+    // 两条路径都到达了 HTTP 层——不得称为传输失败，R10 不触发。
+    let a = run_with_https(
+        RouteMode::NoAppProxy,
+        vec![
+            ok_sample(https(1), 400),
+            ok_sample(https(2), 400),
+            ok_sample(https(3), 400),
+        ],
+    );
+    let b = run_with_https(
+        RouteMode::ManualLocalProxy,
+        vec![
+            status_sample(https(1), 403),
+            status_sample(https(2), 403),
+            status_sample(https(3), 403),
+        ],
+    );
+    let out = diagnose(&[a, b]);
+    assert!(
+        find_rule(&out, "R10").is_none(),
+        "全 403 是收到响应而非传输失败，不得触发跨路径传输差异"
+    );
+    // 403 仍由 R05 如实报告。
+    assert!(find_rule(&out, "R05").is_some());
+}
+
+#[test]
+fn regression_r10_transport_failure_across_distinct_modes_still_fires() {
+    // 修复不得破坏原有触发：不同模式 + 一方全成功 + 另一方真实传输失败。
+    let good = run_with_https(
+        RouteMode::NoAppProxy,
+        vec![
+            ok_sample(https(1), 400),
+            ok_sample(https(2), 400),
+            ok_sample(https(3), 400),
+        ],
+    );
+    let bad = run_with_https(
+        RouteMode::ManualLocalProxy,
+        vec![transport(https(1), ErrorKind::ProxyUnavailable); 3],
+    );
+    let out = diagnose(&[good, bad]);
+    let r10 = find_rule(&out, "R10").expect("不同模式 + 真实传输失败应触发 R10");
+    assert!(
+        r10.observed_facts
+            .iter()
+            .any(|fact| fact.contains("传输失败"))
     );
 }
