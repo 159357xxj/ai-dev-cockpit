@@ -31,7 +31,19 @@
 ## 升级
 
 直接运行新版安装包覆盖安装；数据库结构使用向前兼容的版本化迁移，
-历史数据自动保留。升级前建议备份 `history.db`。
+历史数据自动保留。
+
+### 升级前备份（重要）
+
+应用使用 SQLite WAL 模式：最近写入可能仍在 `history.db-wal` 中、尚未合并进主库。
+**只复制 `history.db` 一个文件不构成可靠备份**。可靠的备份方式（任选其一）：
+
+1. **推荐：先退出应用**（确保进程完全结束，任务管理器无 `ai-dev-cockpit.exe`），
+   再把 `history.db`、`history.db-wal`、`history.db-shm` **三个文件一起复制**。
+2. 使用任意 SQLite 工具执行 Backup API（如 `sqlite3 history.db ".backup backup.db"`），
+   可在应用运行时安全进行。
+3. 应用完全关闭后，`history.db-wal` 若已自动合并（checkpoint），仅备份 `history.db` 即可——
+   但请以"三文件一起复制"为默认做法，不必判断合并状态。
 
 ## 常见问题
 

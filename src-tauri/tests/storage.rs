@@ -252,10 +252,11 @@ fn sanitize_text_masks_secrets() {
     let path = sanitize_text("错误发生在 C:\\Users\\alice\\config.ini");
     assert!(path.contains("[本地路径]"), "{path}");
     assert!(!path.contains("alice"));
-    // Authorization
+    // Authorization（F-02 后统一遮蔽标记为 [已隐藏]）
     let auth = sanitize_text("header Authorization: Bearer eyJhbGciOi");
-    assert!(auth.contains("[认证头已隐藏]"), "{auth}");
+    assert!(auth.contains("[已隐藏]"), "{auth}");
     assert!(!auth.contains("eyJhbGciOi"));
+    assert!(!auth.contains("Bearer"));
     // 普通文本不受影响
     assert_eq!(
         sanitize_text("DNS 解析失败：no such host"),

@@ -7,6 +7,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# F-05：显式最小权限——仅读取仓库内容；CI 不创建 Release、不改仓库设置/可见性。
+permissions:
+  contents: read
+
 jobs:
   frontend:
     name: 前端质量基线

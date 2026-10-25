@@ -270,9 +270,8 @@ struct ProxySnapshot { user_proxy: UserProxyInfo, env_vars: Vec<EnvVarInfo>, cap
 - IPC：`diagnose_runs(runs) -> Vec<Diagnosis>`（白名单命令，无网络）。前端结论卡仅排序、
   去重与展示；空结果不渲染。
 - **验收状态（2026-10-25）**：Phase 4 已通过功能验收（真机三项验证 PASS）。
-  **已知待复核**：R11 触发条件中"HTTPS 全部失败"目前以 `https_successes()`（仅 2xx）判定，
-  未区分"全部样本收到非 2xx 响应"的组合——该场景表述会与"未获得 HTTP 响应"的事实矛盾。
-  Phase 5 持久化开工前必须先补失败测试并修正（见 TEST_PLAN Phase 4 验收小节）。
+  R11 非 2xx 误判风险已通过专项修复关闭（2026-10-25，见 TEST_PLAN 与 ADR D-021）：
+  触发条件改为"全部已执行样本均为传输失败"，非 2xx 响应归 R05/R07/R08 覆盖。
 
 ### 7.4 Windows 代理配置快照（Phase 3）
 三来源分别检测、分别标注（`platform/windows/proxy.rs`，全部只读 API）：

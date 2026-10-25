@@ -41,24 +41,76 @@ pub const REPORT_NOTE: &str = "本报告由 AI Dev Cockpit 基于有限采样（
 诊断结论为离线规则引擎的确定性输出，仅描述已观测事实与可能解释，不代表根因判定。\
 报告已在本地脱敏（凭证、令牌、本地用户路径已遮蔽），导出过程无任何网络上传。";
 
-/// 对运行与诊断做导出级脱敏：样本错误文本过 sanitize_text。
-fn sanitized(run: &DiagnosticRun) -> DiagnosticRun {
-    let mut run = run.clone();
-    for target in &mut run.targets {
-        for sample in &mut target.samples {
-            if let Some(error) = &mut sample.error {
-                error.summary = sanitize_text(&error.summary);
-                error.detail = error.detail.as_deref().map(sanitize_text);
-            }
-        }
-    }
-    run
+/// 结构化安全导出模型（F-02）：**不直接序列化内部 DiagnosticRun/Diagnosis**，
+/// 逐字段挑选允许导出的内容构建——自由文本（错误摘要/细节、诊断字段）全部经
+/// `sanitize_text`，杜绝嵌套字段绕过脱敏的通道。保留：目标 ID、探测类型、
+/// 路由模式、采样号、成功、耗时、状态码、结果分类、错误类别、统计口径。
+fn secure_run_json(run: &DiagnosticRun) -> serde_json::Value {
+    serde_json::json!({
+        "run_id": run.run_id,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "status": run.status,
+        "route_mode": run.route_mode,
+        "repeats": run.repeats,
+        "app_version": run.app_version,
+        "targets": run.targets.iter().map(|target| serde_json::json!({
+            "target_id": target.target_id,
+            "aggregates": target.aggregates.iter().map(|aggregate| serde_json::json!({
+                "probe_type": aggregate.probe_type,
+                "attempts_total": aggregate.attempts_total,
+                "cancelled_count": aggregate.cancelled_count,
+                "success_count": aggregate.success_count,
+                "transport_failure_count": aggregate.transport_failure_count,
+                "http_response_count": aggregate.http_response_count,
+                "request_failure_rate": aggregate.request_failure_rate,
+                "duration_min_ms": aggregate.duration_min_ms,
+                "duration_median_ms": aggregate.duration_median_ms,
+                "duration_max_ms": aggregate.duration_max_ms,
+            })).collect::<Vec<_>>(),
+            "samples": target.samples.iter().map(|sample| serde_json::json!({
+                "probe_type": sample.probe_type,
+                "route_mode": sample.route_mode,
+                "attempt_no": sample.attempt_no,
+                "success": sample.success,
+                "duration_ms": sample.duration_ms,
+                "http_status": sample.http_status,
+                "http_outcome": sample.http_outcome,
+                "error_kind": sample.error.as_ref().map(|error| error.kind),
+                "error_summary": sample.error.as_ref().map(|error| sanitize_text(&error.summary)),
+                "error_detail": sample.error.as_ref().and_then(|error| error.detail.as_deref().map(sanitize_text)),
+                "tested_at": sample.tested_at,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// 诊断结论的安全化：同样逐字段（自由文本字段过 sanitize_text）。
+fn secure_diagnoses_json(diagnoses: &[Diagnosis]) -> serde_json::Value {
+    diagnoses
+        .iter()
+        .map(|diagnosis| {
+            serde_json::json!({
+                "rule_id": diagnosis.rule_id,
+                "title": sanitize_text(&diagnosis.title),
+                "severity": diagnosis.severity,
+                "confidence": diagnosis.confidence,
+                "observed_facts": diagnosis.observed_facts.iter().map(|fact| sanitize_text(fact)).collect::<Vec<_>>(),
+                "possible_causes": diagnosis.possible_causes.iter().map(|cause| sanitize_text(cause)).collect::<Vec<_>>(),
+                "verification_steps": diagnosis.verification_steps.iter().map(|step| sanitize_text(step)).collect::<Vec<_>>(),
+                "limitations": diagnosis.limitations.iter().map(|limit| sanitize_text(limit)).collect::<Vec<_>>(),
+                "related_target_ids": diagnosis.related_target_ids,
+                "related_probe_types": diagnosis.related_probe_types,
+            })
+        })
+        .collect::<Vec<_>>()
+        .into()
 }
 
 /// 生成报告内容（纯函数，便于测试）。
 pub fn build_report(run: &DiagnosticRun, format: ReportFormat) -> (String, String) {
-    let run = sanitized(run);
-    let diagnoses: Vec<Diagnosis> = diagnose(std::slice::from_ref(&run));
+    // 诊断在**原始**数据上求值（避免脱敏文本影响规则匹配），输出再安全化。
+    let diagnoses: Vec<Diagnosis> = diagnose(std::slice::from_ref(run));
     let filename = match format {
         ReportFormat::Json => format!("adc-report-{}.json", run.run_id),
         ReportFormat::Markdown => format!("adc-report-{}.md", run.run_id),
@@ -71,8 +123,8 @@ pub fn build_report(run: &DiagnosticRun, format: ReportFormat) -> (String, Strin
                     "exported_at": crate::diagnostic::types::now_rfc3339(),
                     "note": REPORT_NOTE,
                 },
-                "run": run,
-                "diagnoses": diagnoses,
+                "run": secure_run_json(run),
+                "diagnoses": secure_diagnoses_json(&diagnoses),
             });
             serde_json::to_string_pretty(&payload).unwrap_or_default()
         }
@@ -108,19 +160,21 @@ pub fn build_report(run: &DiagnosticRun, format: ReportFormat) -> (String, Strin
             for diagnosis in &diagnoses {
                 markdown.push_str(&format!(
                     "### {} {}（置信：{:?}）\n\n",
-                    diagnosis.rule_id, diagnosis.title, diagnosis.confidence
+                    diagnosis.rule_id,
+                    sanitize_text(&diagnosis.title),
+                    diagnosis.confidence
                 ));
                 for fact in &diagnosis.observed_facts {
-                    markdown.push_str(&format!("- 事实：{fact}\n"));
+                    markdown.push_str(&format!("- 事实：{}\n", sanitize_text(fact)));
                 }
                 for cause in &diagnosis.possible_causes {
-                    markdown.push_str(&format!("- 可能原因：{cause}\n"));
+                    markdown.push_str(&format!("- 可能原因：{}\n", sanitize_text(cause)));
                 }
                 for step in &diagnosis.verification_steps {
-                    markdown.push_str(&format!("- 建议步骤：{step}\n"));
+                    markdown.push_str(&format!("- 建议步骤：{}\n", sanitize_text(step)));
                 }
                 for limit in &diagnosis.limitations {
-                    markdown.push_str(&format!("- 局限：{limit}\n"));
+                    markdown.push_str(&format!("- 局限：{}\n", sanitize_text(limit)));
                 }
                 markdown.push('\n');
             }
