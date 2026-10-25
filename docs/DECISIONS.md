@@ -131,6 +131,7 @@
   4. 取消样本不触发任何传输失败规则（D-014 延续）；传输失败与 HTTP 非 2xx 分口径；R10/R11 明确"独立测量不强行归因"；R12 用 insufficient 表达"样本不支持结论"；
   5. 禁止断言（IP 信誉/ISP 封锁/TUN 绕过/账号可登录/节点必然更快/服务器宕机）由**测试扫描**守护：标题与 possible_causes 中出现即失败（为此规则文案避免使用这些词的否定句式）。
 - 后果：IPC 新增 `diagnose_runs(runs) -> Vec<Diagnosis>`（纯函数、限 16 运行）；前端结论卡只做展示与排序去重；TS DTO 同步（types.ts Diagnosis/Severity/Confidence）。
+- **验收记录（2026-10-25）**：Phase 4 正式通过功能验收——用户在真实 Tauri 桌面窗口完成三项人工验证（Windows 代理快照 / GitHub 真实诊断与规则结论 / 取消恢复，全部 PASS）。**遗留**：R11 对"HTTPS 全部非 2xx 响应"场景的误判风险登记为 Phase 5 开工前置项（详见 TEST_PLAN Phase 4 验收小节），持久化实施前必须先验证并处理。
 
 ## 变更流程
 新决策追加新编号条目（如 D-011）；推翻旧决策时新条目标注"替代 D-xxx"，旧条目状态改为"已替代（见 D-xxx）"。
