@@ -92,7 +92,7 @@
 1. 真实 Tauri 桌面窗口：Windows 代理配置快照读取正常（真实 WinINet/WinHTTP/环境变量数据）；
 2. GitHub 真实诊断运行正常，规则结论卡展示正常；
 3. 任务取消及界面恢复正常，无虚假成功记录、无重复结论。
-自动化基线同日全绿：cargo test 95 项、npm test 35 项、fmt/clippy/lint/typecheck/build 全部 PASS。
+自动化基线同日全绿：cargo test 95 项、npm test 35 项、fmt/clippy/lint/typecheck/build 全部 PASS。（测试数随后续迭代持续增长，最新计数见 README 与各阶段记录。）
 Phase 4 正式关闭。
 
 **R11 非 2xx 误判风险——已修复（2026-10-25 专项修复，测试先行）**：

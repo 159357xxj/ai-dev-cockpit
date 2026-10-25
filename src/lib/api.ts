@@ -91,8 +91,16 @@ export const api = {
   /** 脱敏报告：先预览（不落盘），确认后导出到应用数据目录 exports/。 */
   previewSanitizedReport: (runId: string, format: ReportFormat): Promise<ReportPreview> =>
     callIpc<ReportPreview>('preview_sanitized_report', { run_id: runId, format }),
-  exportSanitizedReport: (runId: string, format: ReportFormat): Promise<ExportResult> =>
-    callIpc<ExportResult>('export_sanitized_report', { run_id: runId, format }),
+  exportSanitizedReport: (
+    runId: string,
+    format: ReportFormat,
+    snapshotId: string,
+  ): Promise<ExportResult> =>
+    callIpc<ExportResult>('export_sanitized_report', {
+      run_id: runId,
+      format,
+      snapshot_id: snapshotId,
+    }),
 
   /** 启动诊断（低层句柄：一般应使用 runDiagnostic 以获得事件流）。 */
   startDiagnostic: (request: DiagnosticRequest): Promise<JobHandle> =>

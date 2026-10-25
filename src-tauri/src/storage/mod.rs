@@ -402,6 +402,16 @@ impl Storage {
         })
     }
 
+    /// 删除设置键（内部使用：导出后清理一次性快照 id 记录）。
+    pub fn delete_setting(&self, key: &str) -> Result<(), IpcError> {
+        self.with_connection(|connection| {
+            connection
+                .execute("DELETE FROM settings WHERE key = ?1", [key])
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+    }
+
     pub fn set_setting(&self, key: &str, value_json: &str) -> Result<(), IpcError> {
         self.with_connection(|connection| {
             connection

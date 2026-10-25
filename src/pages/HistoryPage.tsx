@@ -133,12 +133,18 @@ export function HistoryPage() {
   const onExport = (): void => {
     if (!preview) return;
     api
-      .exportSanitizedReport(preview.run_id, preview.format)
+      .exportSanitizedReport(preview.run_id, preview.format, preview.snapshot_id)
       .then((result) => {
         setExportPath(result.path);
         setPreview(null);
       })
-      .catch((raw) => setError(normalizeIpcError(raw)));
+      .catch((raw) => {
+        const error = normalizeIpcError(raw);
+        if (error.code === 'cancelled') {
+          return; // 用户在另存为对话框取消：快照保留，可再次导出。
+        }
+        setError(error);
+      });
   };
 
   return (

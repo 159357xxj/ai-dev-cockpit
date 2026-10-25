@@ -120,7 +120,8 @@ src/
 | `get_run` | `(run_id: string) -> DiagnosticRun` | P5 |
 | `delete_run` | `(run_id: string) -> Ok` | P5 |
 | `clear_history` | `() -> Ok` | P5 |
-| `preview_sanitized_report` | `(run_id: string) -> ReportPreview` | P5 |
+| `preview_sanitized_report` | `(run_id: string, format: "json"\|"markdown") -> ReportPreview`（含不透明 `snapshot_id`） | P5 |
+| `export_sanitized_report` | `(run_id: string, format, snapshot_id: string) -> ExportResult`（F-07：复用预览快照的同一份脱敏字节；快照单次使用、有 TTL 与数量/字节上限） | P5 |
 | `export_sanitized_report` | `(run_id: string, format: "json" \| "markdown") -> ExportResult` | P5 |
 
 ### 5.3 事件

@@ -37,10 +37,23 @@ fn generate_certs() -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>, 
             .unwrap_or_default()
     ));
     std::fs::create_dir_all(&work_dir).map_err(|error| format!("{error}"))?;
+
+    // OpenSSL 可移植性（V2 QA 发现：干净 Windows 环境下 openssl 会找
+    // `C:\Program Files\Common Files\ssl\openssl.cnf` 而失败）。
+    // 生成最小配置文件，并以**进程级** OPENSSL_CONF 传给 openssl 子进程——
+    // 不修改系统环境变量，不依赖 Conda/Git Bash 的配置路径。
+    let openssl_conf = work_dir.join("openssl.cnf");
+    std::fs::write(
+        &openssl_conf,
+        "[openssl_init]\n# 最小可用配置（仅让 openssl 启动）\n",
+    )
+    .map_err(|error| format!("{error}"))?;
+
     let run = |args: &[&str]| -> Result<String, String> {
         let output = std::process::Command::new("openssl")
             .args(args)
             .current_dir(&work_dir)
+            .env("OPENSSL_CONF", &openssl_conf)
             .output()
             .map_err(|error| {
                 format!("openssl 不可用（{error}）；完整 TLS 成功测试需要 openssl 生成 RSA 证书")

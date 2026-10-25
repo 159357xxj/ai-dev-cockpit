@@ -408,14 +408,10 @@ fn rule_r04_https_timeout(
             severity: Severity::Warning,
             confidence,
             observed_facts: vec![format!(
-                "{} 次已执行的 HTTPS 采样中有 {} 次在 {} 毫秒超时窗口内未完成",
-                executed,
-                failures.len(),
-                failures
-                    .first()
-                    .and_then(|sample| sample.error.as_ref())
-                    .map(|error| error.summary.clone())
-                    .unwrap_or_else(|| "限定".to_string())
+                // F-02 V2：事实只引用结构化计数——不嵌入原始错误摘要，
+                // 杜绝自由文本经 observed_facts 进入报告的污染通道。
+                "{executed} 次已执行的 HTTPS 采样中有 {} 次在限定超时窗口内未完成",
+                failures.len()
             )],
             possible_causes: vec![
                 "网络路径丢包或拥塞导致响应缓慢".to_string(),

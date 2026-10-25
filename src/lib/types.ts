@@ -225,6 +225,8 @@ export interface ReportPreview {
   content: string;
   filename: string;
   note: string;
+  /** 服务端不可变快照 id（F-07）：导出时透传，复用同一份脱敏字节。 */
+  snapshot_id: string;
 }
 
 export interface ExportResult {
