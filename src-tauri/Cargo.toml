@@ -17,6 +17,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = []
+# V6-R1（契约 F-1..F-10）：仅测试启用的"提交前钩子"，用于在临时文件写完、
+# 提交之前注入竞争者，从而可复现地验证 F-3 竞态。**默认关闭**：
+# release 构建不包含 test_hooks 模块（可用 `cargo tree -e features -i tempfile`
+# 或 `cargo build --release` 确认未启用）。
+test-hooks = []
+
 [dependencies]
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +36,10 @@ reqwest = { version = "0.12", features = ["socks"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rusqlite = { version = "0.41.0", features = ["bundled"] }
+# V6-R1（F-1/F-7）：原子"不替换"提交——NamedTempFile 同目录独占创建 +
+# persist_noclobber（Windows 映射为不带 MOVEFILE_REPLACE_EXISTING 的
+# MoveFileExW）。生产代码使用，故为普通依赖（非 dev-dependencies）。
+tempfile = "3"
 
 # Phase 3：Windows 只读代理配置 API（WinINet 用户配置 + WinHTTP 默认配置）。
 # windows-sys 已存在于依赖树（tauri 传递依赖），此处仅显式启用所需特性。

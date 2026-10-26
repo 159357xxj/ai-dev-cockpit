@@ -433,12 +433,12 @@ impl SnapshotStore {
         Err(IpcError::new(IpcErrorCode::InvalidInput, "快照不在进行中"))
     }
 
-    /// 写盘失败：InFlight → Available（可重试）。
+    /// 写盘失败（含 `TargetExists`）：InFlight → Available（可用同一份字节换名重试）。
     ///
-    /// F-07-DATA 修复：**本函数不删除任何文件路径**——临时文件的清理是
-    /// `save_report_atomic` 内部事务的职责（仅清理其以 `create_new` 独占
-    /// 创建、所有权可证明的临时文件）。把用户选定的最终路径传入本函数的
-    /// 旧用法已废除（保留参数兼容但忽略，待下个大版本移除）。
+    /// **本函数不删除任何文件路径**——临时文件的清理是 `save_report_atomic`
+    /// 内部事务的职责（`PersistError.file` 的 Drop 只删除本事务独占创建的
+    /// 临时文件，所有权可证明）。把用户选定的最终路径传入本函数的旧用法已
+    /// 废除（保留参数兼容但忽略，待下个大版本移除）。
     pub fn finish_failure(
         &mut self,
         snapshot_id: &str,
@@ -467,61 +467,133 @@ impl SnapshotStore {
     }
 }
 
-/// 原子保存事务（F-07-DATA 根因修复）：
-/// 1. 目标已存在 → **fail-closed 拒绝**（提示选择新文件名，不覆盖不破坏）；
-/// 2. 同目录创建随机独占临时文件（`create_new(true)`——不会覆盖任何已有文件，
-///    两个并发事务各得各的临时文件）；
-/// 3. 写入 + flush + sync 成功后 `rename` 提交（Windows 同卷 rename 对不存在
-///    目标是原子替换；目标若在此间被创建，rename 失败 → 回退为拒绝）；
-/// 4. 任何失败只删除**本次事务以 create_new 创建的临时文件**（所有权可证明），
-///    绝不触碰用户选定的最终路径或其它任何文件。
-pub fn save_report_atomic(target: &std::path::Path, content: &str) -> Result<(), String> {
+/// 保存事务错误（F-2）：`TargetExists` 必须能与其它 IO 失败区分，并由 IPC 层
+/// 映射为稳定错误码（`target_exists`）。
+#[derive(Debug)]
+pub enum SaveError {
+    /// 目标路径上已存在任何对象（文件 / 目录 / 符号链接 / junction）。
+    /// 已冻结的产品决策：一律拒绝保存并提示换名，不提供覆盖选项。
+    TargetExists,
+    /// 其它文件系统错误：临时文件创建、写入、同步或提交失败。
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SaveError::TargetExists => write!(
+                formatter,
+                "目标文件已存在；为保护现有内容已拒绝覆盖，请选择其他文件名"
+            ),
+            SaveError::Io(error) => write!(formatter, "保存失败：{error}"),
+        }
+    }
+}
+
+impl std::error::Error for SaveError {}
+
+impl From<std::io::Error> for SaveError {
+    fn from(error: std::io::Error) -> Self {
+        SaveError::Io(error)
+    }
+}
+
+/// 测试专用"提交前钩子"（F-3）：**仅 `--features test-hooks` 编译**。
+/// 在临时文件写完、提交之前调用，用于确定性地复现"提交前目标被创建"的竞态。
+/// 生产构建不存在该模块。
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// 回调使用 `Arc` 而非 `Box`：取出克隆后**释放锁再调用**，
+    /// 避免钩子内部再次设置钩子导致死锁。
+    pub type BeforeCommitHook = Arc<dyn Fn(&Path) + Send + Sync + 'static>;
+
+    static HOOK: OnceLock<Mutex<Option<BeforeCommitHook>>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<BeforeCommitHook>> {
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    /// 设置（或清除）全局提交前钩子。用例结束必须清除，避免影响同进程其它用例。
+    pub fn set_before_commit(hook: Option<BeforeCommitHook>) {
+        let mut guard = slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = hook;
+    }
+
+    pub(crate) fn before_commit(target: &Path) {
+        let hook = {
+            let guard = slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.clone()
+        };
+        if let Some(hook) = hook {
+            hook(target);
+        }
+    }
+}
+
+/// 原子"不替换"保存事务（F-1..F-8，关闭 V5-F07-TOCTOU）：
+/// 1. 同目录、随机名、**独占创建**临时文件（`tempfile` 内部使用 `CREATE_NEW`
+///    语义），前缀 `.adc-tmp-`（F-7）；
+/// 2. 写入 + `sync_all`，保证提交前数据已落盘；
+/// 3. **唯一提交原语**是 `persist_noclobber`——Windows 上映射为不带
+///    `MOVEFILE_REPLACE_EXISTING` 的 `MoveFileExW`，目标已存在即失败（F-1）；
+/// 4. 任何失败只 drop 本事务的临时文件（`PersistError.file` 的 Drop 负责删除，
+///    F-6），绝不删除、截断或替换目标路径（F-5）。
+///
+/// 安全性**不依赖** `exists()` / `metadata()` 预检查；预检查只用于提前给出
+/// 友好提示。竞态窗口内目标被创建的情况由提交步骤以 `TargetExists` 拒绝。
+pub fn save_report_atomic(target: &std::path::Path, content: &str) -> Result<(), SaveError> {
     use std::io::Write as _;
 
     let Some(parent) = target.parent() else {
-        return Err("目标路径缺少父目录".to_string());
+        return Err(SaveError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "目标路径缺少父目录",
+        )));
     };
     if !parent.is_dir() {
-        return Err(format!("目标目录不存在或不可写：{}", parent.display()));
+        return Err(SaveError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("目标目录不存在或不可写：{}", parent.display()),
+        )));
     }
-    // fail-closed：已存在 → 拒绝覆盖（V5 策略：不实现原子替换，保提示新名）。
+
+    // 仅用于提前友好提示，不提供安全保证；安全性由 persist_noclobber 保证。
     if target.exists() {
-        return Err("目标文件已存在；为保护现有内容已拒绝覆盖，请选择新文件名".to_string());
+        return Err(SaveError::TargetExists);
     }
 
-    // 同目录随机独占临时文件：create_new 保证 (a) 新建 (b) 不覆盖任何文件。
-    let temp_path = parent.join(format!(".adc-tmp-{}.tmp", uuid::Uuid::new_v4().simple()));
-    let mut temp_file = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-    {
-        Ok(file) => file,
-        Err(error) => return Err(format!("无法创建临时文件：{error}")),
-    };
+    let mut temp = tempfile::Builder::new()
+        .prefix(".adc-tmp-")
+        .tempfile_in(parent)?;
+    temp.write_all(content.as_bytes())?;
+    temp.as_file().sync_all()?;
 
-    let commit = (|| -> Result<(), String> {
-        temp_file
-            .write_all(content.as_bytes())
-            .map_err(|error| format!("写入失败：{error}"))?;
-        temp_file
-            .flush()
-            .map_err(|error| format!("刷新失败：{error}"))?;
-        temp_file
-            .sync_all()
-            .map_err(|error| format!("同步失败：{error}"))?;
-        drop(temp_file);
-        // 提交：rename。Windows 上目标已存在时 rename 失败 → fail-closed。
-        std::fs::rename(&temp_path, target).map_err(|error| format!("提交失败：{error}"))
-    })();
+    #[cfg(feature = "test-hooks")]
+    test_hooks::before_commit(target);
 
-    if let Err(error) = commit {
-        // 只清理本事务创建的临时文件（create_new 所有权证明）；
-        // 绝不删除 target 或任何其它路径。
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(error);
+    // F-1：唯一提交路径。失败即失败，不存在任何"改用别的方法"的回退（F-5）。
+    match temp.persist_noclobber(target) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            // 提交已经失败，这里的 metadata 只用于**区分错误类型**
+            // （目录 / 符号链接 / junction 在 Windows 上可能返回
+            // ERROR_ACCESS_DENIED 而非 ERROR_ALREADY_EXISTS），不构成安全依赖。
+            if error.error.kind() == std::io::ErrorKind::AlreadyExists
+                || std::fs::symlink_metadata(target).is_ok()
+            {
+                Err(SaveError::TargetExists)
+            } else {
+                Err(SaveError::Io(error.error))
+            }
+        }
     }
-    Ok(())
 }
 
 /// 预览脱敏报告：生成一次完整脱敏内容并存为服务端不可变快照，
@@ -596,15 +668,22 @@ pub fn export_sanitized_report(
         return Err(IpcError::new(IpcErrorCode::Cancelled, "已取消导出"));
     };
 
-    // 原子保存事务：临时文件 → 同步 → rename；失败只清理自有临时文件，
-    // 快照回 Available（可重试）。目标已存在 → fail-closed 拒绝覆盖。
+    // 原子"不替换"提交：失败只清理自有临时文件，快照回 Available（可重试）。
+    // TargetExists 序列化为可区分错误码（F-2 / F-10），不得并入 internal。
     if let Err(error) = save_report_atomic(&path, &snapshot.content) {
         let _ = state
             .snapshot_store
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .finish_failure(&snapshot_id, None);
-        return Err(IpcError::new(IpcErrorCode::Internal, error));
+        return Err(match error {
+            SaveError::TargetExists => {
+                IpcError::new(IpcErrorCode::TargetExists, "文件已存在，请选择其他文件名")
+            }
+            SaveError::Io(io_error) => {
+                IpcError::new(IpcErrorCode::Internal, format!("保存失败：{io_error}"))
+            }
+        });
     }
     let size_bytes = snapshot.content.len() as u64;
     state

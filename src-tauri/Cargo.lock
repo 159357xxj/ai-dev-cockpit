@@ -30,6 +30,7 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-util",
