@@ -259,3 +259,155 @@ $ git diff b642334 -- src-tauri/src/commands/report.rs \
 **开发者自测通过，待 Codex 按 Gate A 契约独立复验。**
 
 本结论仅覆盖开发者本地自测范围。Gate B 与 Gate C 全部为 `NOT TESTED`，F-2 符号链接分支与 F-10 的真实桌面 UI 表现亦为 `NOT TESTED`，不得据此发布或宣称完整 Windows Release Gate 通过。
+
+---
+
+## 11. 对 Codex V7 结论的回应
+
+Codex V7 复验（`docs/RELEASE_ACCEPTANCE_REPORT_V7.md`，基线 `bf1d639`）判定 Gate A 失败，P1 为 **V7-T2-APP-VERSION**：数据库中的 `app_version` 原样进入 JSON/Markdown 导出。R6 修复该项，并把"导出字段可能携带数据库/运行时自由文本"这一类问题一次性用**库结构驱动的金丝雀测试**关掉。
+
+### 11.1 V7-T2-APP-VERSION：修复方式与代码位置
+
+**缺陷**：`SafeAppVersion` 旧实现只做"字符集 + 长度"校验（`normalize_app_version`），通过即**原样返回**。因此 `sk-CANARY0000000000`、`canary-a1.corp.internal`、`10.13.37.42` 这类满足字符集的串可以从 `runs.app_version` 一路进到导出。字符集不是隐私过滤。
+
+**修复**：
+
+| 导出位置 | 旧行为 | 新行为 |
+|---|---|---|
+| `meta.app_version`（"生成报告的应用版本"） | 取运行记录的版本 | 固定为编译期常量 `env!("CARGO_PKG_VERSION")`，**不读运行记录** |
+| `run.app_version`（被记录的那次运行的版本） | 字符集通过即原样输出 | 与编译期版本或 `KNOWN_RELEASED_VERSIONS` 中某项**完全相等**才输出该 `&'static str` 常量，否则固定 `unknown-version` |
+
+| 代码位置 | 内容 |
+|---|---|
+| `src-tauri/src/commands/report_export.rs:101-145` | `CURRENT_BUILD_VERSION`、`KNOWN_RELEASED_VERSIONS = &["0.1.0"]`、`whitelisted_version`、`SafeAppVersion(&'static str)` |
+| `report_export.rs:620` | 投影：`meta.app_version = SafeAppVersion::current_build()` |
+| `report_export.rs:632` | 投影：`run.app_version = SafeAppVersion::from_record(&run.app_version)` |
+| （已删除） | `normalize_app_version`（"字符集 + 长度通过就原样返回"）整体删除 |
+
+`SafeAppVersion` 现在**只持有 `&'static str`**，`current_build` / `from_record` 均为模块私有，外部无法从任意 `String` 构造；DTO 中该字段的取值集合是 `{编译期常量, "0.1.0", "unknown-version"}`。
+
+**回归测试**：`tests/v6_export_field_audit.rs` 的 `app_version_whitelist_rejects_v7_canaries` 直接用 Codex 的三个最小复现值，断言四份输出（JSON/Markdown 预览与落盘文件）都不含 `canary`/`sk-`/`10.13.37`，且记录版本显示为 `unknown-version`、元数据版本显示为编译期常量。列级审计另覆盖 `runs.app_version => CLEAN`。
+
+### 11.2 导出 DTO 字段审计（任务 2）
+
+渲染器可达的全部结构体与字段（`render_json` 使用全部字段；Markdown 只使用其中一部分，不影响审计口径）。**结论：没有任何字段可以承载数据库/运行时/用户输入的自由文本。**
+
+| 结构体.字段 | 类型 | 数据来源 | 可能来自数据库/运行时/输入 | 处理方式 |
+|---|---|---|---|---|
+| `ExportReport.meta` | `ExportMeta` | 投影构造 | 否 | 嵌套结构体 |
+| `ExportReport.run` | `ExportRun` | 投影构造 | 否 | 嵌套结构体 |
+| `ExportReport.diagnoses` | `Vec<ExportDiagnosis>` | 引擎诊断投影 | 否 | 集合 |
+| `ExportMeta.app_version` | `SafeAppVersion(&'static str)` | 编译期常量 `env!("CARGO_PKG_VERSION")` | 否（**不读记录**） | 编译期常量 |
+| `ExportMeta.exported_at` | `SafeTimestamp(String)` | 运行时系统时钟 | 是（运行时） | chrono 规范化 RFC3339 UTC；不可解析 → `invalid-timestamp` |
+| `ExportMeta.note` | `&'static str` | 常量 `REPORT_NOTE` | 否 | 静态文案 |
+| `ExportRun.run_id` | `SafeRunId(String)` | DB `runs.id` | 是 | 严格 UUID v4 规范化；否则 `invalid-run-id`（T-2 明确允许"规范化 run_id"） |
+| `ExportRun.started_at` | `SafeTimestamp(String)` | DB `runs.started_at` | 是 | RFC3339 规范化；否则 `invalid-timestamp` |
+| `ExportRun.finished_at` | `Option<SafeTimestamp>` | DB `runs.finished_at` | 是 | 同上 |
+| `ExportRun.status` | `RunStatus` | DB `runs.status` | 是（枚举列） | 封闭枚举；解析失败 → `get_run` 拒绝（READ_REJECTED） |
+| `ExportRun.route_mode` | `RouteMode` | DB `runs.route_mode` | 是（枚举列） | 封闭枚举；同上 |
+| `ExportRun.repeats` | `u8` | DB `runs.repeats`（INTEGER） | 是 | 数值 |
+| `ExportRun.app_version` | `SafeAppVersion(&'static str)` | DB `runs.app_version` | 是 | **白名单版本常量**；未命中 → `unknown-version` |
+| `ExportRun.targets` | `Vec<ExportTarget>` | DB `results` 分组 | 否 | 集合 |
+| `ExportTarget.target` | `SafeTargetLabel(&'static str)` | DB `results.target_id` | 是 | 白名单 `id → label`；未命中 → `unknown-target` |
+| `ExportTarget.aggregates` | `Vec<ExportAggregate>` | 由样本重算 | 否 | 集合 |
+| `ExportTarget.samples` | `Vec<ExportSample>` | DB `results` | 否 | 集合 |
+| `ExportAggregate.probe_type` | `ProbeType` | DB `results.probe_type` | 是（枚举列） | 封闭枚举 |
+| `ExportAggregate.attempts_total` | `u32` | 计数 | 是 | 数值 |
+| `ExportAggregate.cancelled_count` | `u32` | 计数 | 是 | 数值 |
+| `ExportAggregate.success_count` | `u32` | 计数 | 是 | 数值 |
+| `ExportAggregate.transport_failure_count` | `u32` | 计数 | 是 | 数值 |
+| `ExportAggregate.http_response_count` | `u32` | 计数 | 是 | 数值 |
+| `ExportAggregate.request_failure_rate` | `f64` | 计算值 | 是 | 数值 |
+| `ExportAggregate.duration_min_ms` | `Option<u64>` | 计算值 | 是 | 数值 / null |
+| `ExportAggregate.duration_median_ms` | `Option<u64>` | 计算值 | 是 | 数值 / null |
+| `ExportAggregate.duration_max_ms` | `Option<u64>` | 计算值 | 是 | 数值 / null |
+| `ExportSample.probe_type` | `ProbeType` | DB `results.probe_type` | 是（枚举列） | 封闭枚举 |
+| `ExportSample.route_mode` | `RouteMode` | DB `results.route_mode` | 是（枚举列） | 封闭枚举 |
+| `ExportSample.attempt_no` | `u32` | DB INTEGER | 是 | 数值 |
+| `ExportSample.success` | `bool` | DB INTEGER(0/1) | 是 | 布尔数值 |
+| `ExportSample.duration_ms` | `Option<u64>` | DB INTEGER | 是 | 数值 / null |
+| `ExportSample.http_status` | `Option<u16>` | DB INTEGER | 是 | 数值 / null |
+| `ExportSample.http_outcome` | `Option<HttpOutcome>` | DB `results.http_outcome` | 是（枚举列） | 封闭枚举；解析失败 → READ_REJECTED |
+| `ExportSample.error_kind` | `Option<ErrorKind>` | DB `results.error_kind` | 是（枚举列） | 封闭枚举；解析失败 → READ_REJECTED |
+| `ExportSample.tested_at` | `SafeTimestamp(String)` | DB `results.tested_at` | 是 | RFC3339 规范化；否则 `invalid-timestamp` |
+| `ExportDiagnosis.rule_id` | `RuleId` | 引擎 `rule_id` | 否 | 封闭枚举（R01..R12 + `unknown-rule`） |
+| `ExportDiagnosis.title` | `SafeDiagnosisTitle(String)` | `diagnosis_title(rule, 安全标签)` | 否 | 静态模板 + `SafeTargetLabel` 确定性生成 |
+| `ExportDiagnosis.severity` | `Severity` | 引擎 | 否 | 封闭枚举 |
+| `ExportDiagnosis.confidence` | `Confidence` | 引擎 | 否 | 封闭枚举 |
+| `ExportDiagnosis.possible_causes` | `&'static [&'static str]` | 模块内静态表 | 否 | 静态文案（源码扫描守护与引擎一致） |
+| `ExportDiagnosis.verification_steps` | `&'static [&'static str]` | 模块内静态表 | 否 | 静态文案 |
+| `ExportDiagnosis.limitations` | `&'static [&'static str]` | 模块内静态表 | 否 | 静态文案 |
+| `ExportDiagnosis.related_targets` | `Vec<SafeTargetLabel>` | 引擎 `related_target_ids` | 是 | 白名单标签；未命中 → `unknown-target` |
+| `ExportDiagnosis.related_probe_types` | `Vec<ProbeType>` | 引擎 | 否 | 封闭枚举 |
+
+重点排查结论：
+
+- **代理地址 / 代理 URL / `user:pass@`**：导出 DTO 中**不存在**任何代理字段。`route_mode` 只是三值枚举；应用内 `ProxySnapshot`（含系统代理、WinHTTP、环境变量来源）只走 UI IPC `get_proxy_snapshot`，**不进入** `build_report` 的输入（`build_report` 的唯一入参是 `&DiagnosticRun`，该结构体没有代理字段）。`report_export.rs` 中与 proxy/host/url 相关的字符串仅为规则静态文案（如 `"用 no_app_proxy 模式对比…"`），不是数据字段。
+- **系统/主机信息、用户名、环境变量**：DTO 无对应字段；导出模块不读环境变量、不读主机信息。
+- **名字带 message / note / label / name / version / path / url / host 的字段**：`note` 是 `&'static str` 常量；`target` 是白名单标签；`app_version` 已白名单化（本次修复）；无 message/path/url/host 字段。
+- **仍由数据库驱动但已被结构约束的字段**：`run_id`（UUID v4 规范化）、`started_at` / `finished_at` / `tested_at`（RFC3339 规范化）。二者属 T-2 明文允许的"规范化 run_id / 时间戳"。
+
+### 11.3 列级金丝雀汇总（任务 3）
+
+测试：`tests/v6_export_field_audit.rs::export_dto_column_canary_audit`。流程：隔离 `tempdir` 中用正式 `Storage::save_run` 写入一条字段尽量填满的基线记录（2 个目标、DNS/TCP/HTTPS 样本、200 与 401 响应、超时与 DNS 失败的 `summary`/`detail`、`manual_local_proxy` 与 `no_app_proxy`、一条 `settings` JSON 记录）→ 用 `SELECT name FROM sqlite_master WHERE type='table'` + `PRAGMA table_info` 枚举**全部 TEXT 列**（不写死列名）→ 每列复制一份基线库、`UPDATE` 该列为 `CANARY_<表>_<列>` → `get_run → build_report → save_report_atomic` → 读回两份文件 → 四份输出统一检查。
+
+```
+---- V6-R6 导出字段列级金丝雀汇总（共 19 轮）----
+results.run_id => CLEAN
+results.target_id => CLEAN
+results.probe_type => READ_REJECTED
+results.route_mode => READ_REJECTED
+results.http_outcome => READ_REJECTED
+results.error_kind => READ_REJECTED
+results.error_summary => CLEAN
+results.error_detail => CLEAN
+results.tested_at => CLEAN
+runs.id => READ_REJECTED
+runs.started_at => CLEAN
+runs.finished_at => CLEAN
+runs.status => READ_REJECTED
+runs.route_mode => READ_REJECTED
+runs.app_version => CLEAN
+runs.notes => CLEAN
+settings.key => CLEAN
+settings.value_json => CLEAN
+settings.value_json (JSON) => CLEAN
+---- 合计：CLEAN 12 / READ_REJECTED 7 / BUILD_REJECTED 0 ----
+---- 说明：build_report 为不可失败签名，导出采用白名单替换而非报错，故 BUILD_REJECTED 恒为 0 ----
+```
+
+READ_REJECTED 的 7 列都是**结构/枚举约束列**：`runs.id`（按原 id 查不到记录）、`runs.status`、`runs.route_mode`、`results.probe_type`、`results.route_mode`、`results.http_outcome`、`results.error_kind`（枚举字面量非法 → `get_run` 返回错误）。这些列的任何非法值都在读取阶段被拒绝，不可能进入导出。
+
+CLEAN 的 12 列覆盖了所有自由文本列：`runs.app_version`（白名单）、`runs.notes`（不导出）、`results.error_summary` / `error_detail`（不导出）、`results.target_id`（白名单标签）、`results.tested_at` / `runs.started_at` / `finished_at`（时间戳规范化）、`results.run_id`（无匹配样本 → 空目标集）、`settings.key` / `value_json`（不参与导出）。
+
+补充用例：
+
+- `run_id_canary_in_database_is_not_exported`：`runs.id` 在列级审计中因"按原 id 查找失败"而 READ_REJECTED，故另按金丝雀 id 读取一次，证明 run_id 即使来自数据库也只会输出 `invalid-run-id`。
+- `app_version_whitelist_rejects_v7_canaries`：直接复现 V7 的三个最小值。
+
+### 11.4 TLS mock 偶发失败调查（任务 4，只调查不修改）
+
+现象：Codex V7 首次 `cargo test --all` 在 `manual_https_proxy_full_tls_success_with_trusted_test_cert` 处报 OpenSSL 无法打开 `leaf.pem`，之后两次全量运行均通过。
+
+**问题 1：证书文件写在哪里？**
+`tests/common/tls_mock.rs:32-39`：目录为
+`std::env::temp_dir().join(format!("adc-tls-mock-{}", SystemTime::now().duration_since(UNIX_EPOCH).as_nanos()))`，
+即以"纳秒时间戳"命名的**系统临时目录子目录**；`openssl` 子进程以 `current_dir(work_dir)` 运行，`ca.key` / `ca.pem` / `leaf.key` / `leaf.csr` / `leaf.pem` / `*.der` 全部写在该目录内。生成结束后 `remove_dir_all(&work_dir)`（`tls_mock.rs:150`）删除整个目录。
+
+**问题 2：多个测试是否共享同一路径或同一目录？**
+设计上**不共享**——每次 `MockTlsServer::spawn()` 都重新生成一个带时间戳的目录。但目录名的时间戳并非真正的高精度唯一值：本机实测 2000 次连续取时（`DateTime::UtcNow`，与 `SystemTime` 同源）在 13.4 ms 内只产生 **3 个不同取值**，即系统时钟的实际粒度约 7 ms 量级。**只要两个 `spawn()` 落在同一个时钟刻度窗口内，就会得到完全相同的目录名**，于是两个测试共享同一目录；`create_dir_all` 对已存在目录不报错，冲突是静默的。
+
+**问题 3：并行运行是否可能互相覆盖或提前删除？**
+可能，且能精确解释观测到的症状。`proxy_modes.rs` 中有 3 处 `MockTlsServer::spawn()`（第 439、477、496 行），同一测试二进制内并行执行。一旦目录名相同：
+
+1. 两个测试交替写 `ca.pem` / `leaf.csr` / `leaf.pem`（互相覆盖）；
+2. 先完成的一方执行 `remove_dir_all(&work_dir)`，把另一方仍在使用的证书文件整体删除；
+3. 另一方随后的 `openssl x509 -in leaf.pem -outform der …` 就会报"无法打开 `leaf.pem`"——与 Codex 观察到的报错一致。
+
+因此根因是**目录名唯一性依赖粗粒度系统时钟 + 无并发隔离 + 结束后无条件删除**，属测试基础设施竞态；不是 TLS 或产品代码缺陷。触发概率低（需要两个 spawn 落在同一时钟窗口），与"三轮中仅首轮失败一次"的观察相符。
+
+**建议的修复方向（本轮按指令不修改）**：目录名加入进程/线程唯一量（如 `std::process::id()` + 原子计数器，或用 `tempfile::TempDir` 保证唯一且延迟清理），并在生成失败时给出明确错误而非让 openssl 直接报缺文件。修复后应连续多轮全量运行验证。
+
+### 11.5 R6 追加结论
+
+**开发者自测通过，待 Codex 复验。**

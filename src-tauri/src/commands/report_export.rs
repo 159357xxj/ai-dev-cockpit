@@ -10,8 +10,8 @@
 //!    - `&'static str` 静态文案（含 `REPORT_NOTE` 与逐规则文案表）；
 //!    - 本模块内唯一构造入口生成的 newtype：`SafeRunId`（规范化 run_id）、
 //!      `SafeTimestamp`（chrono 规范化的 UTC 时间戳）、`SafeAppVersion`
-//!      （受限字符集版本号）、`SafeDiagnosisTitle`（只由 `diagnosis_title`
-//!      生成）。
+//!      （**编译期常量或已知发布版本白名单**，V7-T2-APP-VERSION）、
+//!      `SafeDiagnosisTitle`（只由 `diagnosis_title` 生成）。
 //! 3. **诊断标题不经引擎**（T-3）：`diagnosis_title(rule_id, label)` 用静态
 //!    模板重新拼装，引擎的 `title` / `observed_facts` 自由文本一律不进入
 //!    DTO；只有 `rule_id` / `severity` / `confidence` / `related_*` 与逐规则
@@ -98,19 +98,49 @@ impl SafeTimestamp {
     }
 }
 
-/// 受限字符集的版本号：仅数字/字母/`.`/`+`/`-`，长度 ≤ 32；否则 `unknown`。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// 编译期产品版本：**唯一**可信的"生成报告的应用版本"来源（不读运行记录）。
+const CURRENT_BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// 已知发布版本白名单：历史记录中的版本号只有**完全相等**时才输出常量本身。
+const KNOWN_RELEASED_VERSIONS: &[&str] = &["0.1.0"];
+
+/// 导出用版本号（T-2）：只持有 `&'static str`，取值只能是编译期常量或白名单
+/// 常量。
+///
+/// V7-T2-APP-VERSION 修复：删除了原先的 `normalize_app_version`（"字符集与
+/// 长度通过就原样返回"）——字符集不是隐私过滤；同时不再提供任何"从记录
+/// 字符串构造"的公开入口，记录里的版本号只能经白名单映射落到常量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
-pub struct SafeAppVersion(String);
+pub struct SafeAppVersion(&'static str);
 
 impl SafeAppVersion {
-    pub fn from_raw(raw: &str) -> Self {
-        Self(normalize_app_version(raw))
+    /// 当前构建版本（编译期常量）。
+    fn current_build() -> Self {
+        Self(CURRENT_BUILD_VERSION)
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+    /// 运行记录中的版本 → 白名单常量映射；未命中 → `unknown-version`。
+    fn from_record(raw: &str) -> Self {
+        Self(whitelisted_version(raw))
     }
+
+    pub fn as_str(&self) -> &'static str {
+        self.0
+    }
+}
+
+/// 记录版本 → `&'static str`：只有与编译期版本或已知发布版本**完全相等**时
+/// 才输出常量本身，其余一律 `unknown-version`（绝不输出记录中的原字符串）。
+fn whitelisted_version(raw: &str) -> &'static str {
+    if raw == CURRENT_BUILD_VERSION {
+        return CURRENT_BUILD_VERSION;
+    }
+    KNOWN_RELEASED_VERSIONS
+        .iter()
+        .find(|version| **version == raw)
+        .copied()
+        .unwrap_or("unknown-version")
 }
 
 /// 诊断标题：唯一的构造入口是 [`SafeDiagnosisTitle::from_rule`]（即
@@ -586,7 +616,8 @@ impl ExportDiagnosis {
 pub fn project_report(run: &DiagnosticRun, diagnoses: &[Diagnosis]) -> ExportReport {
     ExportReport {
         meta: ExportMeta {
-            app_version: SafeAppVersion::from_raw(&run.app_version),
+            // V7-T2-APP-VERSION：生成报告的版本固定为编译期常量，不从运行记录读取。
+            app_version: SafeAppVersion::current_build(),
             exported_at: SafeTimestamp::now(),
             note: super::report::REPORT_NOTE,
         },
@@ -597,7 +628,8 @@ pub fn project_report(run: &DiagnosticRun, diagnoses: &[Diagnosis]) -> ExportRep
             status: run.status,
             route_mode: run.route_mode,
             repeats: run.repeats,
-            app_version: SafeAppVersion::from_raw(&run.app_version),
+            // 记录版本号只经白名单落到常量（未知 → unknown-version）。
+            app_version: SafeAppVersion::from_record(&run.app_version),
             targets: run
                 .targets
                 .iter()
@@ -730,18 +762,4 @@ fn normalize_timestamp(raw: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(raw)
         .map(|parsed| parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_else(|_| "invalid-timestamp".to_string())
-}
-
-/// 版本号规范化：仅接受短且受限的字符集（数字/字母/`.`/`+`/`-`）。
-fn normalize_app_version(raw: &str) -> String {
-    let valid = !raw.is_empty()
-        && raw.len() <= 32
-        && raw
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '+' | '-'));
-    if valid {
-        raw.to_string()
-    } else {
-        "unknown".to_string()
-    }
 }
