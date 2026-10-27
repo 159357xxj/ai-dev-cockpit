@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::AppState;
-use crate::diagnostic::rules::{Diagnosis, diagnose};
+use crate::commands::report_export::{SafeRunId, project_report, render_json, render_markdown};
+use crate::diagnostic::rules::diagnose;
 use crate::diagnostic::types::{DiagnosticRun, IpcError, IpcErrorCode};
-use crate::security::redaction::sanitize_text;
 use crate::storage::Storage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,237 +43,28 @@ pub const REPORT_NOTE: &str = "本报告由 AI Dev Cockpit 基于有限采样（
 诊断结论为离线规则引擎的确定性输出，仅描述已观测事实与可能解释，不代表根因判定。\
 报告已在本地脱敏（凭证、令牌、本地用户路径已遮蔽），导出过程无任何网络上传。";
 
-/// 结构化安全导出模型（F-02）：**不直接序列化内部 DiagnosticRun/Diagnosis**，
-/// 逐字段挑选允许导出的内容构建——自由文本（错误摘要/细节、诊断字段）全部经
-/// `sanitize_text`，杜绝嵌套字段绕过脱敏的通道。保留：目标 ID、探测类型、
-/// 路由模式、采样号、成功、耗时、状态码、结果分类、错误类别、统计口径。
-/// 自由文本保守上限（指令 #9：无法保证任意输入完全净化的长文本保守截断）。
-const MAX_FREE_TEXT: usize = 300;
-
-fn sanitize_and_cap(text: &str) -> String {
-    let sanitized = sanitize_text(text);
-    if sanitized.chars().count() <= MAX_FREE_TEXT {
-        sanitized
-    } else {
-        let truncated: String = sanitized.chars().take(MAX_FREE_TEXT).collect();
-        format!("{truncated}…[已截断]")
-    }
-}
-
-/// run_id 校验：生产运行 ID 由调度器生成为 UUID v4。仅接受该格式；
-/// 任何路径分隔符/控制字符/换行/穿越片段 → 安全占位符（fail-closed）。
-fn safe_run_id(run_id: &str) -> String {
-    let cleaned = run_id.trim();
-    let ok = cleaned.len() == 36
-        && cleaned.char_indices().all(|(index, ch)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                ch == '-'
-            } else {
-                ch.is_ascii_hexdigit()
-            }
-        });
-    if ok {
-        cleaned.to_ascii_lowercase()
-    } else {
-        "invalid-run".to_string()
-    }
-}
-
-/// 时间戳校验：必须可被 chrono 解析为 RFC3339；非法 → 安全占位符。
-/// 输出统一为 chrono 规范化后的 UTC 字符串（不含原始噪声）。
-fn safe_timestamp(value: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .map(|parsed| parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-        .unwrap_or_else(|_| "invalid-timestamp".to_string())
-}
-
-/// 应用版本校验：仅接受短且受限的构建版本字符集（数字/字母/./+/-）。
-fn safe_app_version(version: &str) -> String {
-    let ok = !version.is_empty()
-        && version.len() <= 32
-        && version
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '+' | '-'));
-    if ok {
-        version.to_string()
-    } else {
-        "unknown".to_string()
-    }
-}
-
-/// 导出文件名：固定受信前缀 + 已验证的 run_id（UUID 格式，天然无路径字符）
-/// + 固定扩展名。绝不拼接未验证原始 run_id。
-fn safe_filename(run_id: &str, format: ReportFormat) -> String {
+/// 导出文件名：固定受信前缀 + 已规范化的 run_id + 固定扩展名。
+/// run_id 只能是 `SafeRunId`（UUID 形态，天然无路径字符），绝不拼接原始值。
+fn safe_filename(run_id: &SafeRunId, format: ReportFormat) -> String {
     let extension = match format {
         ReportFormat::Json => "json",
         ReportFormat::Markdown => "md",
     };
-    format!("adc-report-{}.{}", safe_run_id(run_id), extension)
-}
-
-/// Markdown 动态文本转义：剥离控制字符（含换行——阻断标题/链接注入），
-/// 转义 Markdown 元字符。用于诊断 title 等仍含动态 ID 的固定文案。
-fn markdown_escape(text: &str) -> String {
-    text.chars()
-        .filter(|ch| !ch.is_control())
-        .map(|ch| match ch {
-            '#' | '[' | ']' | '`' | '\\' | '<' | '>' | '*' | '_' | '(' | ')' | '!' => {
-                format!("\\{ch}")
-            }
-            _ => ch.to_string(),
-        })
-        .collect()
-}
-
-/// target_id 白名单校验（fail-closed）：非预设目标的合成/污染 ID 遮蔽为
-/// [未知目标]——报告标识字段不依赖 renderer 的文本规则。
-fn safe_target_id(target_id: &str) -> String {
-    if crate::diagnostic::targets::find_target(target_id).is_some() {
-        target_id.to_string()
-    } else {
-        "[未知目标]".to_string()
-    }
-}
-
-fn secure_run_json(run: &DiagnosticRun) -> serde_json::Value {
-    serde_json::json!({
-        "run_id": safe_run_id(&run.run_id),
-        "started_at": safe_timestamp(&run.started_at),
-        "finished_at": run.finished_at.as_deref().map(safe_timestamp),
-        "status": run.status,
-        "route_mode": run.route_mode,
-        "repeats": run.repeats,
-        "app_version": safe_app_version(&run.app_version),
-        "targets": run.targets.iter().map(|target| serde_json::json!({
-            "target_id": safe_target_id(&target.target_id),
-            "aggregates": target.aggregates.iter().map(|aggregate| serde_json::json!({
-                "probe_type": aggregate.probe_type,
-                "attempts_total": aggregate.attempts_total,
-                "cancelled_count": aggregate.cancelled_count,
-                "success_count": aggregate.success_count,
-                "transport_failure_count": aggregate.transport_failure_count,
-                "http_response_count": aggregate.http_response_count,
-                "request_failure_rate": aggregate.request_failure_rate,
-                "duration_min_ms": aggregate.duration_min_ms,
-                "duration_median_ms": aggregate.duration_median_ms,
-                "duration_max_ms": aggregate.duration_max_ms,
-            })).collect::<Vec<_>>(),
-            "samples": target.samples.iter().map(|sample| serde_json::json!({
-                "probe_type": sample.probe_type,
-                "route_mode": sample.route_mode,
-                "attempt_no": sample.attempt_no,
-                "success": sample.success,
-                "duration_ms": sample.duration_ms,
-                "http_status": sample.http_status,
-                "http_outcome": sample.http_outcome,
-                "error_kind": sample.error.as_ref().map(|error| error.kind),
-                // F-02 V3 契约收敛：原始 error.summary/detail **默认不导出**
-                // （不可靠净化的自由文本 fail-closed 省略；错误语义由 error_kind
-                // 枚举完整承载）。
-                "tested_at": safe_timestamp(&sample.tested_at),
-            })).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-    })
-}
-
-/// 诊断结论的安全化：同样逐字段（自由文本字段过 sanitize_text）。
-fn secure_diagnoses_json(diagnoses: &[Diagnosis]) -> serde_json::Value {
-    diagnoses
-        .iter()
-        .map(|diagnosis| {
-            serde_json::json!({
-                "rule_id": diagnosis.rule_id,
-                "title": sanitize_and_cap(&diagnosis.title),
-                "severity": diagnosis.severity,
-                "confidence": diagnosis.confidence,
-                "observed_facts": diagnosis.observed_facts.iter().map(|fact| sanitize_and_cap(fact)).collect::<Vec<_>>(),
-                "possible_causes": diagnosis.possible_causes.iter().map(|cause| sanitize_and_cap(cause)).collect::<Vec<_>>(),
-                "verification_steps": diagnosis.verification_steps.iter().map(|step| sanitize_and_cap(step)).collect::<Vec<_>>(),
-                "limitations": diagnosis.limitations.iter().map(|limit| sanitize_and_cap(limit)).collect::<Vec<_>>(),
-                "related_target_ids": diagnosis.related_target_ids.iter().map(|id| safe_target_id(id)).collect::<Vec<_>>(),
-                "related_probe_types": diagnosis.related_probe_types,
-            })
-        })
-        .collect::<Vec<_>>()
-        .into()
+    format!("adc-report-{}.{}", run_id.as_str(), extension)
 }
 
 /// 生成报告内容（纯函数，便于测试）。
+///
+/// V6-R2（T-2/T-3）：先投影为只含安全类型的 `ExportReport`，再交给
+/// `render_json` / `render_markdown`——渲染器不再接触 `DiagnosticRun` /
+/// `Diagnosis`。诊断仍在**原始**数据上求值（规则判断不受投影影响）。
 pub fn build_report(run: &DiagnosticRun, format: ReportFormat) -> (String, String) {
-    // 诊断在**原始**数据上求值（避免脱敏文本影响规则匹配），输出再安全化。
-    let diagnoses: Vec<Diagnosis> = diagnose(std::slice::from_ref(run));
-    let filename = safe_filename(&run.run_id, format);
+    let diagnoses = diagnose(std::slice::from_ref(run));
+    let report = project_report(run, &diagnoses);
+    let filename = safe_filename(&report.run.run_id, format);
     let content = match format {
-        ReportFormat::Json => {
-            let payload = serde_json::json!({
-                "meta": {
-                    "app_version": safe_app_version(&run.app_version),
-                    "exported_at": crate::diagnostic::types::now_rfc3339(),
-                    "note": REPORT_NOTE,
-                },
-                "run": secure_run_json(run),
-                "diagnoses": secure_diagnoses_json(&diagnoses),
-            });
-            serde_json::to_string_pretty(&payload).unwrap_or_default()
-        }
-        ReportFormat::Markdown => {
-            let mut markdown = String::new();
-            markdown.push_str("# AI Dev Cockpit 诊断报告\n\n");
-            markdown.push_str(&format!("- 运行 ID：{}\n", safe_run_id(&run.run_id)));
-            markdown.push_str(&format!(
-                "- 开始时间（UTC）：{}\n",
-                safe_timestamp(&run.started_at)
-            ));
-            markdown.push_str(&format!("- 状态：{:?}\n", run.status));
-            markdown.push_str(&format!("- 路由模式：{:?}\n", run.route_mode));
-            markdown.push_str(&format!("- 采样次数：{}\n", run.repeats));
-            markdown.push_str(&format!(
-                "- 应用版本：{}\n",
-                safe_app_version(&run.app_version)
-            ));
-            markdown.push_str(&format!("\n> {REPORT_NOTE}\n\n## 目标统计\n\n"));
-            for target in &run.targets {
-                markdown.push_str(&format!("### {}\n\n", target.target_id));
-                for aggregate in &target.aggregates {
-                    markdown.push_str(&format!(
-                        "- {:?}：样本 {}，成功 {}，传输失败 {}，收到响应 {}，中位 {:?} ms\n",
-                        aggregate.probe_type,
-                        aggregate.attempts_total,
-                        aggregate.success_count,
-                        aggregate.transport_failure_count,
-                        aggregate.http_response_count,
-                        aggregate.duration_median_ms
-                    ));
-                }
-                markdown.push('\n');
-            }
-            markdown.push_str("## 诊断结论\n\n");
-            if diagnoses.is_empty() {
-                markdown.push_str("无触发规则（测量均在正常范围或样本不足以诊断）。\n");
-            }
-            for diagnosis in &diagnoses {
-                markdown.push_str(&format!(
-                    "### {} {}（置信：{:?}）\n\n",
-                    diagnosis.rule_id,
-                    markdown_escape(&sanitize_and_cap(&diagnosis.title)),
-                    diagnosis.confidence
-                ));
-                for fact in &diagnosis.observed_facts {
-                    markdown.push_str(&format!("- 事实：{}\n", sanitize_and_cap(fact)));
-                }
-                for cause in &diagnosis.possible_causes {
-                    markdown.push_str(&format!("- 可能原因：{}\n", sanitize_and_cap(cause)));
-                }
-                for step in &diagnosis.verification_steps {
-                    markdown.push_str(&format!("- 建议步骤：{}\n", sanitize_and_cap(step)));
-                }
-                for limit in &diagnosis.limitations {
-                    markdown.push_str(&format!("- 局限：{}\n", sanitize_and_cap(limit)));
-                }
-                markdown.push('\n');
-            }
-            markdown
-        }
+        ReportFormat::Json => render_json(&report),
+        ReportFormat::Markdown => render_markdown(&report),
     };
     (content, filename)
 }
