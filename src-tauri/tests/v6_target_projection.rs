@@ -18,30 +18,53 @@ use ai_dev_cockpit_lib::diagnostic::types::{
 use ai_dev_cockpit_lib::storage::Storage;
 
 // ---------------------------------------------------------------------------
-// 金丝雀语料（契约 §2 表格逐条）
+// 金丝雀语料（契约 §2 表格逐条 + Codex V6 复验追加的 7 个样本）
 // ---------------------------------------------------------------------------
 
-/// 契约表格中的全部金丝雀，逐个作为 `target_id` 注入。
-const CANARY_CORPUS: [&str; 9] = [
-    "canary-a1.corp.internal",
-    "10.13.37.42",
-    "192.168.77.7",
-    "fd12:3456:789a::42",
-    "api.openai.com\r\n# CANARY_CRLF",
-    "# CANARY_H1 [x](http://canary.invalid)",
-    "sk-CANARY0000000000",
-    "Cookie: CANARY=1",
-    "C:\\Users\\CANARY_USER\\",
-];
+/// 全部金丝雀，逐个作为 `target_id` 注入（前 9 条来自契约表格，后 7 条来自
+/// `docs/RELEASE_ACCEPTANCE_REPORT_V6.md` 的独立探针：零宽字符、RTL 覆盖、
+/// 全角同形文本、64 KiB 超长值、NUL、反引号代码块、HTML 标签）。
+fn canary_corpus() -> Vec<String> {
+    let mut corpus: Vec<String> = [
+        "canary-a1.corp.internal",
+        "10.13.37.42",
+        "192.168.77.7",
+        "fd12:3456:789a::42",
+        "api.openai.com\r\n# CANARY_CRLF",
+        "# CANARY_H1 [x](http://canary.invalid)",
+        "sk-CANARY0000000000",
+        "Cookie: CANARY=1",
+        "C:\\Users\\CANARY_USER\\",
+        "zw\u{200B}CANARY_ZW",
+        "rtl\u{202E}CANARY_RTL",
+        "ｃａｎａｒｙ-fullwidth.example",
+        "nul\0CANARY_NUL",
+        "```CANARY_BT```",
+        "<img src=x onerror=CANARY_HTML>",
+    ]
+    .iter()
+    .map(|value| (*value).to_string())
+    .collect();
+    // 64 KiB 超长值（契约外补充：长度本身不构成绕过通道）。
+    corpus.push(format!("{}CANARY_LONG", "A".repeat(65536)));
+    corpus
+}
 
 /// 输出中不得出现的片段（不区分大小写；`CANARY` 由 `canary` 覆盖）。
-const FORBIDDEN_FRAGMENTS: [&str; 6] = [
+const FORBIDDEN_FRAGMENTS: [&str; 11] = [
     "canary",
     "10.13.37",
     "192.168.77",
     "fd12:",
     "corp.internal",
     "canary_user",
+    // 码点级：零宽空格、RTL 覆盖、NUL。
+    "\u{200B}",
+    "\u{202E}",
+    "\u{0000}",
+    // 全角同形文本与 HTML 标签。
+    "ｃａｎａｒｙ",
+    "<img",
 ];
 
 const CANARY_ERR_SUMMARY: &str = "CANARY_ERR_SUMMARY";
@@ -53,13 +76,13 @@ const CANARY_ERR_DETAIL: &str = "CANARY_ERR_DETAIL";
 
 /// 构造一次运行：每个 `target_id` 都进入 `TargetResult::target_id`
 /// **以及** `ProbeSample::target_id`（两个通道都要覆盖），错误文本也带金丝雀。
-fn run_with_target_ids(target_ids: &[&str]) -> DiagnosticRun {
+fn run_with_target_ids(target_ids: &[String]) -> DiagnosticRun {
     let targets = target_ids
         .iter()
         .enumerate()
         .map(|(index, target_id)| {
             let sample = ProbeSample {
-                target_id: target_id.to_string(),
+                target_id: target_id.clone(),
                 probe_type: ProbeType::Https,
                 route_mode: RouteMode::NoAppProxy,
                 attempt_no: u32::try_from(index).unwrap_or(0) + 1,
@@ -77,7 +100,7 @@ fn run_with_target_ids(target_ids: &[&str]) -> DiagnosticRun {
             let samples = vec![sample];
             let aggregates = vec![ProbeAggregate::from_samples(ProbeType::Https, &samples)];
             TargetResult {
-                target_id: target_id.to_string(),
+                target_id: target_id.clone(),
                 samples,
                 aggregates,
             }
@@ -97,11 +120,11 @@ fn run_with_target_ids(target_ids: &[&str]) -> DiagnosticRun {
 }
 
 fn canary_run() -> DiagnosticRun {
-    run_with_target_ids(&CANARY_CORPUS)
+    run_with_target_ids(&canary_corpus())
 }
 
 fn whitelisted_run() -> DiagnosticRun {
-    run_with_target_ids(&["github"])
+    run_with_target_ids(&["github".to_string()])
 }
 
 /// 任意规则编号的合成诊断（用于验证引擎文本不被采信、静态文案与引擎一致）。
@@ -196,7 +219,8 @@ fn assert_target_name_consistent(json: &str, markdown: &str, label: &str, occurr
 #[test]
 fn export_canary_corpus_json_md_preview_and_file() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let run = canary_run();
+    let corpus = canary_corpus();
+    let run = run_with_target_ids(&corpus);
 
     let (json_preview, json_name) = build_report(&run, ReportFormat::Json);
     let (md_preview, md_name) = build_report(&run, ReportFormat::Markdown);
@@ -247,14 +271,22 @@ fn export_canary_corpus_json_md_preview_and_file() {
             && raw_titles.to_lowercase().contains("corp.internal"),
         "引擎标题应携带原始 target_id，否则本用例没有覆盖投影：{raw_titles}"
     );
+    // 码点级反证：零宽空格 / RTL 覆盖 / NUL / 64 KiB 超长值同样先进入过引擎标题，
+    // 因此上面"输出不含这些字符"确实是被投影拦下来的。
+    for codepoint in ['\u{200B}', '\u{202E}', '\0'] {
+        assert!(
+            raw_titles.contains(codepoint),
+            "引擎标题应携带码点 U+{:04X}",
+            u32::from(codepoint)
+        );
+    }
+    assert!(
+        raw_titles.len() > 65536 && raw_titles.contains("CANARY_LONG"),
+        "引擎标题应携带 64 KiB 超长 target_id"
+    );
 
     // 同一目标在 JSON 与 Markdown 中的名称完全一致（T-4）。
-    assert_target_name_consistent(
-        &json_preview,
-        &md_preview,
-        "unknown-target",
-        CANARY_CORPUS.len(),
-    );
+    assert_target_name_consistent(&json_preview, &md_preview, "unknown-target", corpus.len());
 
     // JSON：所有字符串值不含控制字符（T-6）。
     let parsed: serde_json::Value = serde_json::from_str(&json_preview).expect("JSON 可解析");
@@ -274,7 +306,8 @@ fn export_canary_from_history_db() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("history.db");
     let storage = Storage::open(&db_path).expect("打开隔离数据库");
-    let run = canary_run();
+    let corpus = canary_corpus();
+    let run = run_with_target_ids(&corpus);
     storage.save_run(&run).expect("写入隔离数据库");
 
     let loaded = storage.get_run(&run.run_id).expect("从数据库读回运行");
@@ -300,12 +333,7 @@ fn export_canary_from_history_db() {
             "{label} 应显示 unknown-target"
         );
     }
-    assert_target_name_consistent(
-        &json_preview,
-        &md_preview,
-        "unknown-target",
-        CANARY_CORPUS.len(),
-    );
+    assert_target_name_consistent(&json_preview, &md_preview, "unknown-target", corpus.len());
 
     let parsed: serde_json::Value = serde_json::from_str(&json_preview).expect("JSON 可解析");
     assert_no_control_characters(&parsed, "$");
@@ -358,6 +386,33 @@ fn target_label_mapping_is_exact_match_only() {
         SafeTargetLabel::from_target_id("").as_str(),
         "unknown-target"
     );
+}
+
+/// T-1 对**公网 IP** 同样适用：白名单只包含域名，因此任何 IP 形式的目标
+/// 都必须显示为 `unknown-target`。
+///
+/// 注意：这不影响 `sanitize_text` 对公网 IP 的保留策略——那条规则属于
+/// 历史/界面文本的脱敏口径（公网 IP 不是个人数据），与导出目标名无关；
+/// 导出链路已完全不经过 `sanitize_text`。
+#[test]
+fn public_ip_target_maps_to_unknown_target() {
+    let corpus: Vec<String> = ["203.0.113.9", "198.51.100.7", "2001:db8::1"]
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
+    let run = run_with_target_ids(&corpus);
+    let (json, _) = build_report(&run, ReportFormat::Json);
+    let (markdown, _) = build_report(&run, ReportFormat::Markdown);
+
+    for output in [&json, &markdown] {
+        for fragment in ["203.0.113", "198.51.100", "2001:db8"] {
+            assert!(
+                !output.contains(fragment),
+                "公网 IP 目标不得出现在导出中：{fragment}"
+            );
+        }
+    }
+    assert_target_name_consistent(&json, &markdown, "unknown-target", corpus.len());
 }
 
 #[test]
