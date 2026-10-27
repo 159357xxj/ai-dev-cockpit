@@ -699,25 +699,29 @@ fn fmt_millis(value: Option<u64>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// 规范化实现（与 V5 行为保持一致；run_id 的严格 UUID 校验属 V6-R3）
+// 规范化实现
 // ---------------------------------------------------------------------------
 
-/// run_id 规范化：仅接受「长度 36 + 第 8/13/18/23 位为 `-` + 其余十六进制」，
-/// 输出小写；否则固定占位符（fail-closed，不回显原值）。
+/// run_id 规范化（V6-R3 / U-1、U-2）：必须是**UUID v4**（`Version::Random`
+/// 且 `Variant::RFC4122`）的规范 36 字符形式。
+///
+/// - `uuid::Uuid::parse_str` 负责结构性解析；
+/// - `get_version() == Some(Version::Random)` 排除 v1/v3/v5/v7 等其它版本；
+/// - `get_variant() == Variant::RFC4122` 排除错误 variant（如第 20 位为 `c`）；
+/// - `raw.len() == 36` 排除花括号形式（38）、`urn:uuid:` 前缀（45）与
+///   无连字符形式（32）——`uuid` 的解析器接受这些写法，长度校验把它们挡在外面。
+///
+/// 不合法的输入统一输出固定占位符 `invalid-run-id`（不回显原值、不使导出失败）。
 fn normalize_run_id(raw: &str) -> String {
-    let cleaned = raw.trim();
-    let valid = cleaned.len() == 36
-        && cleaned.char_indices().all(|(index, ch)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                ch == '-'
-            } else {
-                ch.is_ascii_hexdigit()
-            }
-        });
-    if valid {
-        cleaned.to_ascii_lowercase()
-    } else {
-        "invalid-run".to_string()
+    match uuid::Uuid::parse_str(raw) {
+        Ok(parsed)
+            if parsed.get_version() == Some(uuid::Version::Random)
+                && parsed.get_variant() == uuid::Variant::RFC4122
+                && raw.len() == 36 =>
+        {
+            parsed.hyphenated().to_string()
+        }
+        _ => "invalid-run-id".to_string(),
     }
 }
 

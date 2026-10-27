@@ -327,18 +327,21 @@ fn save_refuses_existing_dir() {
     assert_no_temp_leftovers(dir.path());
 }
 
+/// F-2 的符号链接分支：创建符号链接需要 SeCreateSymbolicLinkPrivilege
+/// （Windows 开发者模式或提权）。该特权缺失时无法构造前提，因此本用例默认
+/// `ignored`——普通 `cargo test` 会显示为 ignored 而不是 passed，杜绝
+/// 「无权限提前返回」造成的假通过。提权/开发者模式下用 `cargo test --ignored` 执行。
 #[test]
+#[ignore = "requires SeCreateSymbolicLinkPrivilege; run with --ignored in elevated shell"]
 fn save_refuses_existing_symlink() {
     let dir = tempfile::tempdir().expect("tempdir");
     let victim = dir.path().join("victim.txt");
     std::fs::write(&victim, b"VICTIM").expect("预置被指向文件");
     let link = dir.path().join("link.json");
 
-    if let Err(error) = create_file_symlink(&victim, &link) {
-        // 无 SeCreateSymbolicLinkPrivilege 的环境：明确标记未执行，而不是假通过。
-        println!("SKIPPED: no symlink privilege ({error})");
-        return;
-    }
+    create_file_symlink(&victim, &link).expect(
+        "创建符号链接失败：需要 SeCreateSymbolicLinkPrivilege（请在提权 shell 或开启开发者模式后用 `cargo test --ignored` 运行）",
+    );
 
     let before_len = std::fs::metadata(&victim).expect("元数据").len();
     let before_mtime = modified(&victim);
@@ -368,7 +371,8 @@ fn save_refuses_existing_symlink() {
     // 悬空符号链接：`exists()` 为 false，因此必须由提交步骤（而非预检查）
     // 拒绝——绝不能顺着链接把内容写到别处或新建同名文件。
     let dangling = dir.path().join("dangling.json");
-    create_file_symlink(&dir.path().join("no-such-victim.txt"), &dangling).expect("创建悬空链接");
+    create_file_symlink(&dir.path().join("no-such-victim.txt"), &dangling)
+        .expect("创建悬空符号链接失败：需要 SeCreateSymbolicLinkPrivilege");
     let error = save_report_atomic(&dangling, "OURS").expect_err("悬空符号链接必须拒绝");
     assert!(
         matches!(&error, SaveError::TargetExists),

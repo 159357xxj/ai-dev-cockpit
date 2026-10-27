@@ -109,15 +109,17 @@ fn v5_finish_failure_never_deletes_user_file() {
 
     let run = sample_run("run-x");
     let (content, filename) = build_report(&run, ReportFormat::Json);
-    store.insert(ReportSnapshot {
-        snapshot_id: "s1".into(),
-        run_id: run.run_id.clone(),
-        format: ReportFormat::Json,
-        content: std::sync::Arc::from(content.as_str()),
-        filename,
-        created_at: std::time::Instant::now(),
-        state: SnapshotState::Available,
-    }).unwrap();
+    store
+        .insert(ReportSnapshot {
+            snapshot_id: "s1".into(),
+            run_id: run.run_id.clone(),
+            format: ReportFormat::Json,
+            content: std::sync::Arc::from(content.as_str()),
+            filename,
+            created_at: std::time::Instant::now(),
+            state: SnapshotState::Available,
+        })
+        .unwrap();
     let _ = store.take("s1", &run.run_id, ReportFormat::Json).unwrap();
     // 旧实现把用户文件路径当 partial 传入会删除它；新实现 finish_failure
     // 只恢复快照状态，不删除任何路径（删除仅限 save 内部临时文件）。
@@ -206,15 +208,17 @@ fn v5_saved_bytes_equal_preview_via_atomic_save() {
     let mut store = SnapshotStore::default();
     let run = sample_run("run-bytes");
     let (preview, filename) = build_report(&run, ReportFormat::Json);
-    store.insert(ReportSnapshot {
-        snapshot_id: "sb".into(),
-        run_id: run.run_id.clone(),
-        format: ReportFormat::Json,
-        content: std::sync::Arc::from(preview.as_str()),
-        filename,
-        created_at: std::time::Instant::now(),
-        state: SnapshotState::Available,
-    }).unwrap();
+    store
+        .insert(ReportSnapshot {
+            snapshot_id: "sb".into(),
+            run_id: run.run_id.clone(),
+            format: ReportFormat::Json,
+            content: std::sync::Arc::from(preview.as_str()),
+            filename,
+            created_at: std::time::Instant::now(),
+            state: SnapshotState::Available,
+        })
+        .unwrap();
     let snapshot = store.take("sb", &run.run_id, ReportFormat::Json).unwrap();
     let dir = temp_dir("bytes");
     let path = dir.join("final.json");
@@ -383,12 +387,12 @@ fn v5_malicious_run_id_timestamps_version_neutralized() {
     let (json, filename) = build_report(&run, ReportFormat::Json);
     let (md, _) = build_report(&run, ReportFormat::Markdown);
 
-    // run_id：路径分隔符/CRLF/标题注入 → invalid-run；文件名不含原始片段。
+    // run_id：路径分隔符/CRLF/标题注入 → invalid-run-id；文件名不含原始片段。
     assert!(!json.contains("../evil"), "run_id 注入 JSON");
     assert!(!md.contains("../evil"), "run_id 注入 MD");
     assert!(!json.contains("HEADLINE"), "标题注入");
     assert!(!filename.contains(".."), "文件名穿越：{filename}");
-    assert!(json.contains("invalid-run"), "应替换为 invalid-run");
+    assert!(json.contains("invalid-run-id"), "应替换为 invalid-run-id");
 
     // 时间戳：非法输入 → invalid-timestamp，无 canary。
     for payload in [&json, &md] {

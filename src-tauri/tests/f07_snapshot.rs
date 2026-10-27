@@ -53,15 +53,17 @@ fn contaminated_run_for_snapshot() -> DiagnosticRun {
 fn do_preview(store: &mut SnapshotStore, run: &DiagnosticRun) -> (String, String, String) {
     let (content, filename) = build_report(run, ReportFormat::Json);
     let snapshot_id = format!("snap-{}", store.available_count());
-    store.insert(ReportSnapshot {
-        snapshot_id: snapshot_id.clone(),
-        run_id: run.run_id.clone(),
-        format: ReportFormat::Json,
-        content: std::sync::Arc::from(content.as_str()),
-        filename: filename.clone(),
-        created_at: std::time::Instant::now(),
-        state: SnapshotState::Available,
-    }).unwrap();
+    store
+        .insert(ReportSnapshot {
+            snapshot_id: snapshot_id.clone(),
+            run_id: run.run_id.clone(),
+            format: ReportFormat::Json,
+            content: std::sync::Arc::from(content.as_str()),
+            filename: filename.clone(),
+            created_at: std::time::Instant::now(),
+            state: SnapshotState::Available,
+        })
+        .unwrap();
     (content, filename, snapshot_id)
 }
 
@@ -252,15 +254,17 @@ fn f07_ttl_expiry_rejects_expired_snapshot() {
     let run = contaminated_run_for_snapshot();
 
     // 直接构造过期快照（created_at 回拨 11 分钟，超过 600s TTL）。
-    store.insert(ReportSnapshot {
-        snapshot_id: "snap-expired".to_string(),
-        run_id: run.run_id.clone(),
-        format: ReportFormat::Json,
-        content: std::sync::Arc::from("expired-content"),
-        filename: "f.json".into(),
-        created_at: std::time::Instant::now() - std::time::Duration::from_secs(660),
-        state: SnapshotState::Available,
-    }).unwrap();
+    store
+        .insert(ReportSnapshot {
+            snapshot_id: "snap-expired".to_string(),
+            run_id: run.run_id.clone(),
+            format: ReportFormat::Json,
+            content: std::sync::Arc::from("expired-content"),
+            filename: "f.json".into(),
+            created_at: std::time::Instant::now() - std::time::Duration::from_secs(660),
+            state: SnapshotState::Available,
+        })
+        .unwrap();
 
     let error = store
         .take("snap-expired", &run.run_id, ReportFormat::Json)
@@ -275,15 +279,17 @@ fn f07_count_limit_enforced() {
         let mut run = contaminated_run_for_snapshot();
         run.run_id = format!("run-{index}");
         let (content, filename) = build_report(&run, ReportFormat::Json);
-        store.insert(ReportSnapshot {
-            snapshot_id: format!("snap-{index}"),
-            run_id: run.run_id.clone(),
-            format: ReportFormat::Json,
-            content: std::sync::Arc::from(content.as_str()),
-            filename,
-            created_at: std::time::Instant::now(),
-            state: SnapshotState::Available,
-        }).unwrap();
+        store
+            .insert(ReportSnapshot {
+                snapshot_id: format!("snap-{index}"),
+                run_id: run.run_id.clone(),
+                format: ReportFormat::Json,
+                content: std::sync::Arc::from(content.as_str()),
+                filename,
+                created_at: std::time::Instant::now(),
+                state: SnapshotState::Available,
+            })
+            .unwrap();
     }
     assert_eq!(store.available_count(), 8, "数量上限 8");
     assert!(
