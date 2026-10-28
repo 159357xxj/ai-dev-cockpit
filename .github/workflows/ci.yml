@@ -32,9 +32,18 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97.1"
           components: rustfmt, clippy
+      - name: Verify pinned Rust toolchain
+        shell: pwsh
+        working-directory: src-tauri
+        run: |
+          $v = (rustc --version)
+          Write-Host $v
+          if ($v -notmatch '^rustc 1\.97\.1 ') { throw "Expected rustc 1.97.1, got: $v" }
+          cargo clippy --version
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
@@ -72,7 +81,17 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
+      - name: Verify pinned Rust toolchain
+        shell: pwsh
+        run: |
+          $v = (rustc --version)
+          Write-Host $v
+          if ($v -notmatch '^rustc 1\.97\.1 ') { throw "Expected rustc 1.97.1, got: $v" }
+          cargo clippy --version
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
