@@ -1,0 +1,16 @@
+PR URL: https://github.com/159357xxj/ai-dev-cockpit/pull/1
+PR number: 1
+PR state: OPEN; draft=true; mergedAt=null
+Run URL: https://github.com/159357xxj/ai-dev-cockpit/actions/runs/40684249981
+Run ID: 40684249981
+Event: pull_request
+headSha: 51e654dfe0ecf01cc6141d62cda52918d2d37b46
+Run conclusion: failure
+
+Jobs:
+- Rust 质量基线 | job 122802462904 | failure | https://github.com/159357xxj/ai-dev-cockpit/actions/runs/40684249981/job/122802462904
+- 前端质量基线 | job 122802463288 | success | https://github.com/159357xxj/ai-dev-cockpit/actions/runs/40684249981/job/122802463288
+- 构建 NSIS 安装包（手动） | job 122802465240 | skipped (expected for pull_request) | https://github.com/159357xxj/ai-dev-cockpit/actions/runs/40684249981/job/122802465240
+
+Reruns: none. The failure was cargo clippy, not one of the authorized flaky tests.
+Log collection: `gh run view 40684249981 --log` failed with results-receiver EOF. Full per-job logs were retrieved through read-only GitHub diagnostics for the verified headSha and stored in run.log (logTruncated=false for each returned job).

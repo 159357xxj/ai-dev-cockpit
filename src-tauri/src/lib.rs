@@ -12,7 +12,7 @@ pub mod platform;
 pub mod security;
 pub mod storage;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use diagnostic::backend::{ProbeBackend, ProductionBackend};
 use storage::Storage;
@@ -23,6 +23,8 @@ pub struct AppState {
     pub backend: Arc<dyn ProbeBackend>,
     /// None = 存储不可用（历史/导出命令返回 internal 错误，其余功能不受影响）。
     pub storage: Option<Arc<Storage>>,
+    /// 报告快照管理（F-07：预览与导出复用同一份脱敏字节）。
+    pub snapshot_store: Mutex<commands::report::SnapshotStore>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -56,6 +58,7 @@ pub fn run() {
             app.manage(AppState {
                 backend: Arc::new(backend),
                 storage,
+                snapshot_store: Mutex::new(commands::report::SnapshotStore::default()),
             });
             Ok(())
         })

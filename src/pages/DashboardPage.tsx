@@ -1,14 +1,6 @@
+import { lazy, Suspense } from 'react';
 import { Link } from 'react-router';
 import { Activity, Info, Radar } from 'lucide-react';
-import {
-  CartesianGrid,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from 'recharts';
 
 import { DemoBadge, DemoBanner } from '@/components/layout/demo';
 import { ProxySnapshotCard } from '@/components/dashboard/ProxySnapshotCard';
@@ -24,7 +16,7 @@ import {
 } from '@/components/ui/card';
 import { useAppSettings } from '@/app/settings';
 import { fmtDurationMs, fmtUtcToLocal } from '@/lib/format';
-import { MOCK_RECENT_RUN, MOCK_SYSTEM_SNAPSHOT, MOCK_TREND } from '@/features/demo/mockData';
+import { MOCK_RECENT_RUN, MOCK_SYSTEM_SNAPSHOT } from '@/features/demo/mockData';
 
 const LIMITATIONS = [
   '本工具是只读诊断工具：不修改代理、DNS、路由、防火墙或注册表，不请求管理员权限。',
@@ -32,6 +24,8 @@ const LIMITATIONS = [
   'HTTP 401/403 表示「收到响应，但业务能力未验证」，不代表服务可正常登录或使用。',
   '手动本地代理仅在 127.0.0.1/localhost/[::1] 范围内有效，失败时绝不静默回落为直连。',
 ];
+
+const LazyTrendChart = lazy(() => import('@/components/charts/TrendChart'));
 
 export function DashboardPage() {
   const { settings } = useAppSettings();
@@ -88,23 +82,9 @@ export function DashboardPage() {
                 {MOCK_RECENT_RUN.target_count} 个目标 · 中位耗时{' '}
                 {fmtDurationMs(MOCK_RECENT_RUN.median_ms)}
               </p>
-              <div className="h-28" aria-hidden>
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={MOCK_TREND} margin={{ top: 4, right: 8, bottom: 0, left: -24 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" />
-                    <XAxis dataKey="date" tick={{ fontSize: 10 }} stroke="var(--color-muted-foreground)" />
-                    <YAxis tick={{ fontSize: 10 }} stroke="var(--color-muted-foreground)" />
-                    <Tooltip />
-                    <Line
-                      type="monotone"
-                      dataKey="median_ms"
-                      stroke="var(--color-primary)"
-                      strokeWidth={2}
-                      dot
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
+              <Suspense fallback={<div className="h-28" />}>
+                <LazyTrendChart />
+              </Suspense>
               <p className="text-xs text-muted-foreground">近 5 次（模拟）HTTPS 中位耗时</p>
             </CardContent>
           </Card>

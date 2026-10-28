@@ -3,4 +3,5 @@
 pub mod diagnostics;
 pub mod history;
 pub mod report;
+pub mod report_export;
 pub mod system;

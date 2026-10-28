@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State};
+use tauri::State;
 
 use crate::AppState;
-use crate::diagnostic::rules::{Diagnosis, diagnose};
+use crate::commands::report_export::{SafeRunId, project_report, render_json, render_markdown};
+use crate::diagnostic::rules::diagnose;
 use crate::diagnostic::types::{DiagnosticRun, IpcError, IpcErrorCode};
-use crate::security::redaction::sanitize_text;
 use crate::storage::Storage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +26,8 @@ pub struct ReportPreview {
     pub content: String,
     pub filename: String,
     pub note: String,
+    /// 不透明快照 id：导出命令凭此复用同一份脱敏字节（F-07）。
+    pub snapshot_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -41,91 +43,28 @@ pub const REPORT_NOTE: &str = "本报告由 AI Dev Cockpit 基于有限采样（
 诊断结论为离线规则引擎的确定性输出，仅描述已观测事实与可能解释，不代表根因判定。\
 报告已在本地脱敏（凭证、令牌、本地用户路径已遮蔽），导出过程无任何网络上传。";
 
-/// 对运行与诊断做导出级脱敏：样本错误文本过 sanitize_text。
-fn sanitized(run: &DiagnosticRun) -> DiagnosticRun {
-    let mut run = run.clone();
-    for target in &mut run.targets {
-        for sample in &mut target.samples {
-            if let Some(error) = &mut sample.error {
-                error.summary = sanitize_text(&error.summary);
-                error.detail = error.detail.as_deref().map(sanitize_text);
-            }
-        }
-    }
-    run
+/// 导出文件名：固定受信前缀 + 已规范化的 run_id + 固定扩展名。
+/// run_id 只能是 `SafeRunId`（UUID 形态，天然无路径字符），绝不拼接原始值。
+fn safe_filename(run_id: &SafeRunId, format: ReportFormat) -> String {
+    let extension = match format {
+        ReportFormat::Json => "json",
+        ReportFormat::Markdown => "md",
+    };
+    format!("adc-report-{}.{}", run_id.as_str(), extension)
 }
 
 /// 生成报告内容（纯函数，便于测试）。
+///
+/// V6-R2（T-2/T-3）：先投影为只含安全类型的 `ExportReport`，再交给
+/// `render_json` / `render_markdown`——渲染器不再接触 `DiagnosticRun` /
+/// `Diagnosis`。诊断仍在**原始**数据上求值（规则判断不受投影影响）。
 pub fn build_report(run: &DiagnosticRun, format: ReportFormat) -> (String, String) {
-    let run = sanitized(run);
-    let diagnoses: Vec<Diagnosis> = diagnose(std::slice::from_ref(&run));
-    let filename = match format {
-        ReportFormat::Json => format!("adc-report-{}.json", run.run_id),
-        ReportFormat::Markdown => format!("adc-report-{}.md", run.run_id),
-    };
+    let diagnoses = diagnose(std::slice::from_ref(run));
+    let report = project_report(run, &diagnoses);
+    let filename = safe_filename(&report.run.run_id, format);
     let content = match format {
-        ReportFormat::Json => {
-            let payload = serde_json::json!({
-                "meta": {
-                    "app_version": run.app_version,
-                    "exported_at": crate::diagnostic::types::now_rfc3339(),
-                    "note": REPORT_NOTE,
-                },
-                "run": run,
-                "diagnoses": diagnoses,
-            });
-            serde_json::to_string_pretty(&payload).unwrap_or_default()
-        }
-        ReportFormat::Markdown => {
-            let mut markdown = String::new();
-            markdown.push_str("# AI Dev Cockpit 诊断报告\n\n");
-            markdown.push_str(&format!("- 运行 ID：{}\n", run.run_id));
-            markdown.push_str(&format!("- 开始时间（UTC）：{}\n", run.started_at));
-            markdown.push_str(&format!("- 状态：{:?}\n", run.status));
-            markdown.push_str(&format!("- 路由模式：{:?}\n", run.route_mode));
-            markdown.push_str(&format!("- 采样次数：{}\n", run.repeats));
-            markdown.push_str(&format!("- 应用版本：{}\n", run.app_version));
-            markdown.push_str(&format!("\n> {REPORT_NOTE}\n\n## 目标统计\n\n"));
-            for target in &run.targets {
-                markdown.push_str(&format!("### {}\n\n", target.target_id));
-                for aggregate in &target.aggregates {
-                    markdown.push_str(&format!(
-                        "- {:?}：样本 {}，成功 {}，传输失败 {}，收到响应 {}，中位 {:?} ms\n",
-                        aggregate.probe_type,
-                        aggregate.attempts_total,
-                        aggregate.success_count,
-                        aggregate.transport_failure_count,
-                        aggregate.http_response_count,
-                        aggregate.duration_median_ms
-                    ));
-                }
-                markdown.push('\n');
-            }
-            markdown.push_str("## 诊断结论\n\n");
-            if diagnoses.is_empty() {
-                markdown.push_str("无触发规则（测量均在正常范围或样本不足以诊断）。\n");
-            }
-            for diagnosis in &diagnoses {
-                markdown.push_str(&format!(
-                    "### {} {}（置信：{:?}）\n\n",
-                    diagnosis.rule_id, diagnosis.title, diagnosis.confidence
-                ));
-                for fact in &diagnosis.observed_facts {
-                    markdown.push_str(&format!("- 事实：{fact}\n"));
-                }
-                for cause in &diagnosis.possible_causes {
-                    markdown.push_str(&format!("- 可能原因：{cause}\n"));
-                }
-                for step in &diagnosis.verification_steps {
-                    markdown.push_str(&format!("- 建议步骤：{step}\n"));
-                }
-                for limit in &diagnosis.limitations {
-                    markdown.push_str(&format!("- 局限：{limit}\n"));
-                }
-                markdown.push('\n');
-            }
-            markdown
-        }
+        ReportFormat::Json => render_json(&report),
+        ReportFormat::Markdown => render_markdown(&report),
     };
     (content, filename)
 }
@@ -137,7 +76,319 @@ fn storage<'a>(state: &'a State<'_, AppState>) -> Result<&'a Storage, IpcError> 
         .ok_or_else(|| IpcError::new(IpcErrorCode::Internal, "历史存储不可用"))
 }
 
-/// 预览脱敏报告（不落盘）。
+/// 快照状态机（F-07）：Available →（take）→ InFlight →（成功）→ Consumed /
+/// （取消或写盘失败）→ Available（可重试）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotState {
+    Available,
+    InFlight,
+    Consumed,
+}
+
+/// 服务端不可变报告快照（F-07）：预览与导出复用**同一份脱敏字节**。
+/// 只保存已脱敏内容（绝不缓存未脱敏数据）；id 为 UUID v4（不可预测）；
+/// created_at 用单调时钟 Instant（TTL 判断与创建同基准）。
+#[derive(Debug, Clone)]
+pub struct ReportSnapshot {
+    pub snapshot_id: String,
+    pub run_id: String,
+    pub format: ReportFormat,
+    /// Arc 共享不可变字节：take 返回克隆时不复制内容，实际内存=预算口径。
+    pub content: std::sync::Arc<str>,
+    pub filename: String,
+    pub created_at: std::time::Instant,
+    pub state: SnapshotState,
+}
+
+const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+const SNAPSHOT_MAX_COUNT: usize = 8;
+const SNAPSHOT_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+
+/// 快照管理状态（Mutex 内完成淘汰/插入/取出/状态迁移，用户取消不会破坏状态）。
+#[derive(Default)]
+pub struct SnapshotStore {
+    available: std::collections::VecDeque<ReportSnapshot>,
+    in_flight: Vec<ReportSnapshot>,
+    consumed_count: usize,
+}
+
+impl SnapshotStore {
+    fn total_managed_bytes(&self) -> usize {
+        self.available
+            .iter()
+            .chain(self.in_flight.iter())
+            .map(|item| item.content.len())
+            .sum()
+    }
+
+    fn total_managed_count(&self) -> usize {
+        self.available.len() + self.in_flight.len()
+    }
+
+    /// 淘汰过期 Available（created_at.elapsed() > TTL，单调时钟）。
+    /// InFlight 不参与普通淘汰（生命周期短暂，由 TTL/取消/完成路径释放）。
+    fn evict_expired(&mut self) {
+        self.available
+            .retain(|item| item.created_at.elapsed() < SNAPSHOT_TTL);
+    }
+
+    /// 插入新快照（Available）。预算 = Available + InFlight 统一计费：
+    /// - 单份内容 > 8 MiB → 拒绝（明确错误）；
+    /// - 先淘汰过期 Available，再按需淘汰最旧 Available 直到数量/字节可容纳；
+    /// - InFlight 占用预算但不可被普通淘汰——若仍超限（InFlight 占满）→ 拒绝插入。
+    pub fn insert(&mut self, mut snapshot: ReportSnapshot) -> Result<(), IpcError> {
+        if snapshot.content.len() > SNAPSHOT_MAX_TOTAL_BYTES {
+            return Err(IpcError::new(
+                IpcErrorCode::InvalidInput,
+                "单份报告快照超过 8 MiB 上限，已拒绝",
+            ));
+        }
+        self.evict_expired();
+        snapshot.state = SnapshotState::Available;
+        let needed_bytes = snapshot.content.len();
+        while self.total_managed_count() >= SNAPSHOT_MAX_COUNT {
+            if self.available.is_empty() {
+                return Err(IpcError::new(
+                    IpcErrorCode::InvalidInput,
+                    "快照数量上限已满（InFlight 占用），请稍后重试",
+                ));
+            }
+            self.available.pop_front();
+        }
+        while self.total_managed_bytes() + needed_bytes > SNAPSHOT_MAX_TOTAL_BYTES {
+            if self.available.is_empty() {
+                return Err(IpcError::new(
+                    IpcErrorCode::InvalidInput,
+                    "快照总字节预算已满（InFlight 占用），请稍后重试",
+                ));
+            }
+            self.available.pop_front();
+        }
+        self.available.push_back(snapshot);
+        Ok(())
+    }
+
+    /// 预占快照（take）：Available → InFlight。返回快照内容副本。
+    /// 并发/重复消费：InFlight 不再匹配，第二次 take 返回错误。
+    pub fn take(
+        &mut self,
+        snapshot_id: &str,
+        run_id: &str,
+        format: ReportFormat,
+    ) -> Result<ReportSnapshot, IpcError> {
+        self.evict_expired();
+        let position = self.available.iter().position(|item| {
+            item.snapshot_id == snapshot_id && item.run_id == run_id && item.format == format
+        });
+        let Some(index) = position else {
+            return Err(IpcError::new(
+                IpcErrorCode::InvalidInput,
+                "报告快照不存在、已过期或已使用；请重新预览后再导出",
+            ));
+        };
+        let Some(mut snapshot) = self.available.remove(index) else {
+            return Err(IpcError::new(IpcErrorCode::Internal, "快照状态不一致"));
+        };
+        snapshot.state = SnapshotState::InFlight;
+        // Arc 克隆：内容零拷贝（预算口径内），桶间转移不增加受管内存。
+        self.in_flight.push(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    /// 用户取消另存为：InFlight → Available（同一份字节可重试导出）。
+    pub fn release(&mut self, snapshot_id: &str) -> Result<(), IpcError> {
+        if let Some(position) = self.in_flight.iter().position(|item| {
+            item.snapshot_id == snapshot_id && item.state == SnapshotState::InFlight
+        }) {
+            if position >= self.in_flight.len() {
+                return Err(IpcError::new(IpcErrorCode::Internal, "快照状态不一致"));
+            }
+            let mut snapshot = self.in_flight.swap_remove(position);
+            snapshot.state = SnapshotState::Available;
+            self.evict_expired();
+            self.available.push_back(snapshot);
+            return Ok(());
+        }
+        Err(IpcError::new(IpcErrorCode::InvalidInput, "快照不在进行中"))
+    }
+
+    /// 保存成功：InFlight → Consumed（内容丢弃，快照失效）。
+    pub fn finish_success(&mut self, snapshot_id: &str) -> Result<(), IpcError> {
+        if let Some(position) = self.in_flight.iter().position(|item| {
+            item.snapshot_id == snapshot_id && item.state == SnapshotState::InFlight
+        }) {
+            self.in_flight.remove(position);
+            self.consumed_count += 1;
+            return Ok(());
+        }
+        Err(IpcError::new(IpcErrorCode::InvalidInput, "快照不在进行中"))
+    }
+
+    /// 写盘失败（含 `TargetExists`）：InFlight → Available（可用同一份字节换名重试）。
+    ///
+    /// **本函数不删除任何文件路径**——临时文件的清理是 `save_report_atomic`
+    /// 内部事务的职责（`PersistError.file` 的 Drop 只删除本事务独占创建的
+    /// 临时文件，所有权可证明）。把用户选定的最终路径传入本函数的旧用法已
+    /// 废除（保留参数兼容但忽略，待下个大版本移除）。
+    pub fn finish_failure(
+        &mut self,
+        snapshot_id: &str,
+        _partial_path: Option<&std::path::Path>,
+    ) -> Result<(), IpcError> {
+        if let Some(position) = self.in_flight.iter().position(|item| {
+            item.snapshot_id == snapshot_id && item.state == SnapshotState::InFlight
+        }) {
+            if position >= self.in_flight.len() {
+                return Err(IpcError::new(IpcErrorCode::Internal, "快照状态不一致"));
+            }
+            let snapshot = self.in_flight.swap_remove(position);
+            self.evict_expired();
+            self.available.push_back(snapshot);
+            return Ok(());
+        }
+        Err(IpcError::new(IpcErrorCode::InvalidInput, "快照不在进行中"))
+    }
+
+    pub fn available_count(&self) -> usize {
+        self.available.len()
+    }
+
+    pub fn consumed_count(&self) -> usize {
+        self.consumed_count
+    }
+}
+
+/// 保存事务错误（F-2）：`TargetExists` 必须能与其它 IO 失败区分，并由 IPC 层
+/// 映射为稳定错误码（`target_exists`）。
+#[derive(Debug)]
+pub enum SaveError {
+    /// 目标路径上已存在任何对象（文件 / 目录 / 符号链接 / junction）。
+    /// 已冻结的产品决策：一律拒绝保存并提示换名，不提供覆盖选项。
+    TargetExists,
+    /// 其它文件系统错误：临时文件创建、写入、同步或提交失败。
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SaveError::TargetExists => write!(
+                formatter,
+                "目标文件已存在；为保护现有内容已拒绝覆盖，请选择其他文件名"
+            ),
+            SaveError::Io(error) => write!(formatter, "保存失败：{error}"),
+        }
+    }
+}
+
+impl std::error::Error for SaveError {}
+
+impl From<std::io::Error> for SaveError {
+    fn from(error: std::io::Error) -> Self {
+        SaveError::Io(error)
+    }
+}
+
+/// 测试专用"提交前钩子"（F-3）：**仅 `--features test-hooks` 编译**。
+/// 在临时文件写完、提交之前调用，用于确定性地复现"提交前目标被创建"的竞态。
+/// 生产构建不存在该模块。
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// 回调使用 `Arc` 而非 `Box`：取出克隆后**释放锁再调用**，
+    /// 避免钩子内部再次设置钩子导致死锁。
+    pub type BeforeCommitHook = Arc<dyn Fn(&Path) + Send + Sync + 'static>;
+
+    static HOOK: OnceLock<Mutex<Option<BeforeCommitHook>>> = OnceLock::new();
+
+    fn slot() -> &'static Mutex<Option<BeforeCommitHook>> {
+        HOOK.get_or_init(|| Mutex::new(None))
+    }
+
+    /// 设置（或清除）全局提交前钩子。用例结束必须清除，避免影响同进程其它用例。
+    pub fn set_before_commit(hook: Option<BeforeCommitHook>) {
+        let mut guard = slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = hook;
+    }
+
+    pub(crate) fn before_commit(target: &Path) {
+        let hook = {
+            let guard = slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.clone()
+        };
+        if let Some(hook) = hook {
+            hook(target);
+        }
+    }
+}
+
+/// 原子"不替换"保存事务（F-1..F-8，关闭 V5-F07-TOCTOU）：
+/// 1. 同目录、随机名、**独占创建**临时文件（`tempfile` 内部使用 `CREATE_NEW`
+///    语义），前缀 `.adc-tmp-`（F-7）；
+/// 2. 写入 + `sync_all`，保证提交前数据已落盘；
+/// 3. **唯一提交原语**是 `persist_noclobber`——Windows 上映射为不带
+///    `MOVEFILE_REPLACE_EXISTING` 的 `MoveFileExW`，目标已存在即失败（F-1）；
+/// 4. 任何失败只 drop 本事务的临时文件（`PersistError.file` 的 Drop 负责删除，
+///    F-6），绝不删除、截断或替换目标路径（F-5）。
+///
+/// 安全性**不依赖** `exists()` / `metadata()` 预检查；预检查只用于提前给出
+/// 友好提示。竞态窗口内目标被创建的情况由提交步骤以 `TargetExists` 拒绝。
+pub fn save_report_atomic(target: &std::path::Path, content: &str) -> Result<(), SaveError> {
+    use std::io::Write as _;
+
+    let Some(parent) = target.parent() else {
+        return Err(SaveError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "目标路径缺少父目录",
+        )));
+    };
+    if !parent.is_dir() {
+        return Err(SaveError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("目标目录不存在或不可写：{}", parent.display()),
+        )));
+    }
+
+    // 仅用于提前友好提示，不提供安全保证；安全性由 persist_noclobber 保证。
+    if target.exists() {
+        return Err(SaveError::TargetExists);
+    }
+
+    let mut temp = tempfile::Builder::new()
+        .prefix(".adc-tmp-")
+        .tempfile_in(parent)?;
+    temp.write_all(content.as_bytes())?;
+    temp.as_file().sync_all()?;
+
+    #[cfg(feature = "test-hooks")]
+    test_hooks::before_commit(target);
+
+    // F-1：唯一提交路径。失败即失败，不存在任何"改用别的方法"的回退（F-5）。
+    match temp.persist_noclobber(target) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            // 提交已经失败，这里的 metadata 只用于**区分错误类型**
+            // （目录 / 符号链接 / junction 在 Windows 上可能返回
+            // ERROR_ACCESS_DENIED 而非 ERROR_ALREADY_EXISTS），不构成安全依赖。
+            if error.error.kind() == std::io::ErrorKind::AlreadyExists
+                || std::fs::symlink_metadata(target).is_ok()
+            {
+                Err(SaveError::TargetExists)
+            } else {
+                Err(SaveError::Io(error.error))
+            }
+        }
+    }
+}
+
+/// 预览脱敏报告：生成一次完整脱敏内容并存为服务端不可变快照，
+/// 返回预览内容与不透明 snapshot_id（后续导出复用同一份字节，F-07）。
 #[tauri::command(rename_all = "snake_case")]
 pub fn preview_sanitized_report(
     run_id: String,
@@ -146,38 +397,91 @@ pub fn preview_sanitized_report(
 ) -> Result<ReportPreview, IpcError> {
     let run = storage(&state)?.get_run(&run_id)?;
     let (content, filename) = build_report(&run, format);
+    let snapshot_id = uuid::Uuid::new_v4().to_string();
+    let mut store = state
+        .snapshot_store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    store.insert(ReportSnapshot {
+        snapshot_id: snapshot_id.clone(),
+        run_id: run_id.clone(),
+        format,
+        content: std::sync::Arc::from(content.as_str()),
+        filename: filename.clone(),
+        created_at: std::time::Instant::now(),
+        state: SnapshotState::Available,
+    })?;
     Ok(ReportPreview {
         run_id,
         format,
         content,
         filename,
         note: REPORT_NOTE.to_string(),
+        snapshot_id,
     })
 }
 
-/// 导出脱敏报告到应用数据目录的 exports/ 子目录（本地文件，无上传）。
+/// 导出脱敏报告：弹出系统原生"另存为"对话框（Rust 侧，前端不传路径——
+/// 文件写入信任边界收窄为对话框结果；用户取消返回 cancelled）。
+/// 写入字节与用户确认的预览**完全一致**（同一份服务端快照，F-07）；
+/// 快照单次使用；无任何网络上传。
 #[tauri::command(rename_all = "snake_case")]
 pub fn export_sanitized_report(
     run_id: String,
     format: ReportFormat,
-    app: AppHandle,
+    snapshot_id: String,
     state: State<'_, AppState>,
 ) -> Result<ExportResult, IpcError> {
-    let run = storage(&state)?.get_run(&run_id)?;
-    let (content, filename) = build_report(&run, format);
+    let snapshot = {
+        let mut store = state
+            .snapshot_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        store.take(&snapshot_id, &run_id, format)?
+    };
 
-    let exports_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| IpcError::new(IpcErrorCode::Internal, format!("数据目录不可用：{error}")))?
-        .join("exports");
-    std::fs::create_dir_all(&exports_dir).map_err(|error| {
-        IpcError::new(IpcErrorCode::Internal, format!("创建导出目录失败：{error}"))
-    })?;
-    let path = exports_dir.join(&filename);
-    let size_bytes = content.len() as u64;
-    std::fs::write(&path, content)
-        .map_err(|error| IpcError::new(IpcErrorCode::Internal, format!("写入文件失败：{error}")))?;
+    let extension = match snapshot.format {
+        ReportFormat::Json => "json",
+        ReportFormat::Markdown => "md",
+    };
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("导出脱敏诊断报告")
+        .set_file_name(&snapshot.filename)
+        .add_filter("诊断报告", &[extension])
+        .save_file()
+    else {
+        // 用户取消：快照回到 Available，同一份字节可再次导出。
+        state
+            .snapshot_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .release(&snapshot_id)?;
+        return Err(IpcError::new(IpcErrorCode::Cancelled, "已取消导出"));
+    };
+
+    // 原子"不替换"提交：失败只清理自有临时文件，快照回 Available（可重试）。
+    // TargetExists 序列化为可区分错误码（F-2 / F-10），不得并入 internal。
+    if let Err(error) = save_report_atomic(&path, &snapshot.content) {
+        let _ = state
+            .snapshot_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .finish_failure(&snapshot_id, None);
+        return Err(match error {
+            SaveError::TargetExists => {
+                IpcError::new(IpcErrorCode::TargetExists, "文件已存在，请选择其他文件名")
+            }
+            SaveError::Io(io_error) => {
+                IpcError::new(IpcErrorCode::Internal, format!("保存失败：{io_error}"))
+            }
+        });
+    }
+    let size_bytes = snapshot.content.len() as u64;
+    state
+        .snapshot_store
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .finish_success(&snapshot_id)?;
 
     Ok(ExportResult {
         run_id,
@@ -195,3 +499,6 @@ pub fn make_persister(storage: Arc<Storage>) -> Arc<dyn Fn(&DiagnosticRun) + Sen
         }
     })
 }
+
+/// 测试可见别名：与 ReportSnapshot 同构（集成测试经 pub mod commands 访问）。
+pub type ReportSnapshotForTest = ReportSnapshot;

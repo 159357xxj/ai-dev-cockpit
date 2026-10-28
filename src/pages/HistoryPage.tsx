@@ -45,6 +45,8 @@ export function HistoryPage() {
   const [detail, setDetail] = useState<{ run: DiagnosticRun; diagnoses: Diagnosis[] } | null>(null);
   const [preview, setPreview] = useState<ReportPreview | null>(null);
   const [exportPath, setExportPath] = useState<string | null>(null);
+  /** 保存被拒绝的明确提示（F-10：不得并入笼统的"保存失败"）。 */
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
 
   const refresh = (target: string, mode: string): void => {
@@ -91,6 +93,7 @@ export function HistoryPage() {
 
   const openDetail = (runId: string): void => {
     setExportPath(null);
+    setSaveNotice(null);
     Promise.all([api.getRun(runId), api.diagnoseRuns([]).then(() => null)])
       .then(([,]) => api.getRun(runId))
       .then((run) =>
@@ -124,6 +127,7 @@ export function HistoryPage() {
 
   const onPreview = (runId: string, format: ReportFormat): void => {
     setExportPath(null);
+    setSaveNotice(null);
     api
       .previewSanitizedReport(runId, format)
       .then(setPreview)
@@ -132,13 +136,26 @@ export function HistoryPage() {
 
   const onExport = (): void => {
     if (!preview) return;
+    setSaveNotice(null);
     api
-      .exportSanitizedReport(preview.run_id, preview.format)
+      .exportSanitizedReport(preview.run_id, preview.format, preview.snapshot_id)
       .then((result) => {
         setExportPath(result.path);
         setPreview(null);
       })
-      .catch((raw) => setError(normalizeIpcError(raw)));
+      .catch((raw) => {
+        const error = normalizeIpcError(raw);
+        if (error.code === 'cancelled') {
+          return; // 用户在另存为对话框取消：快照保留，可再次导出。
+        }
+        if (error.code === 'target_exists') {
+          // F-10：目标已存在是明确、可操作的结果——不用笼统错误呈现，
+          // 保留预览与快照，用户换个文件名即可重试。
+          setSaveNotice('文件已存在，请选择其他文件名');
+          return;
+        }
+        setError(error);
+      });
   };
 
   return (
@@ -346,6 +363,12 @@ export function HistoryPage() {
           </CardContent>
         </Card>
       )}
+
+      {saveNotice ? (
+        <Alert variant="warning" className="mt-4">
+          <AlertDescription>{saveNotice}</AlertDescription>
+        </Alert>
+      ) : null}
 
       {exportPath ? (
         <Alert variant="info" className="mt-4">

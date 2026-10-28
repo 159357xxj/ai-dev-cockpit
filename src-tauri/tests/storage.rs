@@ -239,11 +239,10 @@ fn settings_whitelist_behavior() {
 
 #[test]
 fn sanitize_text_masks_secrets() {
-    // userinfo
-    assert!(
-        sanitize_text("http://user:pass@127.0.0.1:7890/proxy")
-            .contains("[凭证已隐藏]@127.0.0.1:7890")
-    );
+    // userinfo（回环 IP 本身也按 fail-closed 遮蔽为 [内网地址]）
+    let masked = sanitize_text("http://user:pass@127.0.0.1:7890/proxy");
+    assert!(masked.contains("[凭证已隐藏]@"));
+    assert!(!masked.contains("user:pass"));
     // 查询 token
     let masked = sanitize_text("https://example.com/path?token=abcdef123456&x=1");
     assert!(masked.contains("token=[已隐藏]"), "{masked}");
@@ -252,10 +251,11 @@ fn sanitize_text_masks_secrets() {
     let path = sanitize_text("错误发生在 C:\\Users\\alice\\config.ini");
     assert!(path.contains("[本地路径]"), "{path}");
     assert!(!path.contains("alice"));
-    // Authorization
+    // Authorization（F-02 后统一遮蔽标记为 [已隐藏]）
     let auth = sanitize_text("header Authorization: Bearer eyJhbGciOi");
-    assert!(auth.contains("[认证头已隐藏]"), "{auth}");
+    assert!(auth.contains("[已隐藏]"), "{auth}");
     assert!(!auth.contains("eyJhbGciOi"));
+    assert!(!auth.contains("Bearer"));
     // 普通文本不受影响
     assert_eq!(
         sanitize_text("DNS 解析失败：no such host"),
@@ -276,8 +276,10 @@ fn report_is_sanitized_and_carries_limitations() {
     assert!(filename.ends_with(".json"));
     assert!(!json.contains("user:secret"), "JSON 报告不得泄漏 userinfo");
     assert!(!json.contains("bob"), "JSON 报告不得泄漏用户名");
-    assert!(json.contains("[凭证已隐藏]"));
-    assert!(json.contains("[本地路径]"));
+    // F-02 V3 契约：自由文本整体省略——遮蔽标记与秘密都不出现。
+    assert!(!json.contains("user:secret"));
+    assert!(!json.contains("bob"));
+    assert!(json.contains("error_kind"), "结构化错误类别仍导出");
     assert!(json.contains("不构成统计显著结论"), "报告必须携带局限说明");
     assert!(json.contains("diagnoses"), "报告包含规则诊断");
 

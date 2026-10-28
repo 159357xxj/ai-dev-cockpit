@@ -10,7 +10,7 @@ import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
-import { useAppSettings, type ThemeSetting } from '@/app/settings';
+import { DEMO_AVAILABLE, useAppSettings, type ThemeSetting } from '@/app/settings';
 import { api } from '@/lib/api';
 
 const THEME_OPTIONS: Array<{ value: ThemeSetting; label: string }> = [
@@ -59,6 +59,7 @@ export function SettingsPage() {
           </CardContent>
         </Card>
 
+        {DEMO_AVAILABLE ? (
         <Card>
           <CardHeader>
             <CardTitle className="text-base">演示模式</CardTitle>
@@ -93,6 +94,7 @@ export function SettingsPage() {
             ) : null}
           </CardContent>
         </Card>
+        ) : null}
 
         <Card>
           <CardHeader>

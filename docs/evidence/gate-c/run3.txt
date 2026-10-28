@@ -1,0 +1,21 @@
+PR URL: https://github.com/159357xxj/ai-dev-cockpit/pull/1
+Run URL: https://github.com/159357xxj/ai-dev-cockpit/actions/runs/40688859414
+Run ID: 40688859414
+Event: pull_request
+headSha: ede0f592daa77449e23b2d4e19e481ce30777fe7
+Run conclusion: success
+
+Jobs:
+- Rust 质量基线 (122818196285): success
+- 前端质量基线 (122818196677): success
+- 构建 NSIS 安装包（手动） (122818199464): skipped (expected for pull_request)
+
+gh run watch 40688859414 --exit-status: exit code 0
+No rerun was performed.
+
+C-08 read-only checks:
+- PR #1: OPEN, draft=true, mergedAt=null
+- gh release list --limit 5: empty
+- Repository visibility: PRIVATE
+- origin refs/heads/main: 166b9bbcf1d19699384497153669828c26f703e1 (matches required baseline)
+- origin refs/heads/fix/v6: ede0f592daa77449e23b2d4e19e481ce30777fe7

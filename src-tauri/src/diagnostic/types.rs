@@ -88,6 +88,9 @@ pub enum IpcErrorCode {
     NotAvailable,
     Internal,
     Cancelled,
+    /// 目标路径已存在（V6-R1 / F-2）：保存被"不替换"提交拒绝，
+    /// 前端据此提示用户换文件名，而不是显示笼统的保存失败。
+    TargetExists,
 }
 
 /// IPC 错误（命令 `Err` 分支的结构化载荷）。

@@ -48,12 +48,10 @@ pub fn start_diagnostic_impl(
     emitter: Emitter,
 ) -> Result<JobHandle, IpcError> {
     request.validate().map_err(IpcError::invalid_input)?;
-    // Phase 2 仅支持 no_app_proxy；其余模式显式禁用（Phase 3 提供）。
-    if request.route_mode != RouteMode::NoAppProxy {
-        return Err(IpcError::not_available(
-            "该连接模式将在 Phase 3 提供（当前仅支持 no_app_proxy）",
-        ));
-    }
+    // F-01 修复：三种合法路由模式（no_app_proxy / library_default / manual_local_proxy）
+    // 均可启动（Phase 3 已实现底层路径）。保留全部参数校验：
+    // - 目标白名单 / 次数 / 超时（request.validate）；
+    // - manual_local_proxy 的 loopback/端口/协议严格校验（无凭证、无路径/查询）。
     if request.route_mode == RouteMode::ManualLocalProxy {
         let raw = request
             .manual_local_proxy_url
@@ -122,14 +120,59 @@ mod tests {
         assert!(events.lock().unwrap().is_empty(), "拒绝时不产生事件");
     }
 
+    /// F-01 回归：三种合法模式都必须越过门控到达后端（Stub 以 not_available
+    /// 应答代表"校验通过并转发"）；非法代理仍 invalid_input。
     #[test]
-    fn impl_rejects_phase3_modes_with_not_available() {
+    fn impl_accepts_all_three_route_modes() {
+        for mode in [
+            RouteMode::NoAppProxy,
+            RouteMode::LibraryDefault,
+            RouteMode::ManualLocalProxy,
+        ] {
+            let mut req = request();
+            req.route_mode = mode;
+            if mode == RouteMode::ManualLocalProxy {
+                req.manual_local_proxy_url = Some("socks5h://127.0.0.1:7890".to_string());
+            }
+            let (emitter, events) = sink_emitter();
+            let error = start_diagnostic_impl(req, &StubBackend::new(), emitter).unwrap_err();
+            // Stub 后端在接收请求后返回 not_available（非 invalid_input）＝已过门控。
+            assert_eq!(
+                error.code,
+                IpcErrorCode::NotAvailable,
+                "模式 {mode:?} 应到达后端，实际被入口拒绝：{error}"
+            );
+            // 事件不泄漏：入口拒绝才会产生空事件；此处后端拒答同样无事件。
+            assert!(events.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn impl_rejects_invalid_manual_proxy_with_invalid_input() {
+        for bad in [
+            "http://proxy.example.com:8080",   // 非回环
+            "http://user:pass@127.0.0.1:7890", // 凭证
+            "http://127.0.0.1:7890/path",      // 路径
+            "ftp://127.0.0.1:21",              // 协议
+        ] {
+            let mut req = request();
+            req.route_mode = RouteMode::ManualLocalProxy;
+            req.manual_local_proxy_url = Some(bad.to_string());
+            let (emitter, _) = sink_emitter();
+            let error = start_diagnostic_impl(req, &StubBackend::new(), emitter).unwrap_err();
+            assert_eq!(error.code, IpcErrorCode::InvalidInput, "应拒绝 {bad}");
+        }
+    }
+
+    /// F-01：library_default 不允许携带代理地址（与请求校验一致）。
+    #[test]
+    fn impl_rejects_proxy_url_on_non_manual_mode() {
         let mut req = request();
         req.route_mode = RouteMode::LibraryDefault;
+        req.manual_local_proxy_url = Some("http://127.0.0.1:7890".to_string());
         let (emitter, _) = sink_emitter();
         let error = start_diagnostic_impl(req, &StubBackend::new(), emitter).unwrap_err();
-        assert_eq!(error.code, IpcErrorCode::NotAvailable);
-        assert!(error.message.contains("Phase 3"));
+        assert_eq!(error.code, IpcErrorCode::InvalidInput);
     }
 
     #[test]

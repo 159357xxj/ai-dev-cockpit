@@ -6,24 +6,25 @@ Windows 10/11 本地优先、无需登录、**只读**的网络诊断桌面工�
 
 ## 当前状态
 
-**Phase 5 已完成（SQLite 历史、趋势对比与脱敏导出）；R11/R10 规则专项修复已通过全量基线。**
+**Phase 5 已通过功能验收（2026-10-25 真机四项 PASS：重启历史保留 / 取消状态正确 / 报告预览导出 / 趋势与删除）。Phase 6 发布准备进行中（NSIS 候选包已构建）。**
 
 | 已实现 | 未实现（按阶段推进） |
 |---|---|
-| Tauri 2 + React 19 + TS strict + Vite 工程与锁文件 | P3：Windows 代理快照；`library_default` / `manual_local_proxy` 模式对比 |
-| 五页界面 + 深浅主题 + 演示模式（显式开启、默认关闭） | P4：规则诊断引擎（离线） |
-| 真实探测：DNS（系统解析器）/ TCP 443 / HTTPS（Reqwest + 证书校验） | P5：SQLite 历史、趋势、脱敏导出 |
-| 调度器：3/5 次采样、并发 ≤3、单请求 1–10s、任务截止 120s、取消 | P6：NSIS 安装包、CI、发布 |
+| Tauri 2 + React 19 + TS strict + Vite 工程与锁文件 | 发布签署（安装包未签名，SmartScreen 提示见 INSTALL） |
+| 五页界面 + 深浅主题 + 演示模式（仅开发构建可开启） | 公开 Release（待人工验收与授权） |
+| 真实探测：DNS（系统解析器）/ TCP 443 / HTTPS（Reqwest + 证书校验） | 外部漏洞数据库审计（npm audit / cargo audit） |
+| 调度器：3/5 次采样、并发 ≤3、单请求 1–10s、任务截止 120s、取消 | |
 | 事件流：progress/completed/failed，终态恰好一个，订阅先于启动 | |
 | 错误分类：dns/tcp/tls 失败、超时、取消、代理不可用、401/403/407/429/5xx 中性细分 | |
 | Windows 代理快照（WinINet/WinHTTP/环境变量，只读、脱敏、来源分别标注） | |
-| 三种 HTTPS 路由模式（no_app_proxy / library_default / manual_local_proxy） | |
+| 三种 HTTPS 路由模式（no_app_proxy / library_default / manual_local_proxy，IPC 三模式全通） | |
 | 路径对比页接入真实测量（多模式顺序执行、样本互不共享） | |
-| 规则诊断引擎：12 条规则（R01–R12）、确定性输出、证据分层（事实/解释/局限） | R11 非 2xx 误判风险待复核（P5 前置项） |
+| 规则诊断引擎：12 条规则（R01–R12）、确定性输出、证据分层（事实/解释/局限）；R11 非 2xx 误判已修复关闭 | |
 | 诊断结论卡：严重程度排序、置信徽标、可展开细节（两页接入） | |
-| SQLite 历史（筛选/趋势/删除/清空）+ 脱敏导出（JSON/MD，先预览后确认） | 桌面重启保留复验待确认 |
+| SQLite 历史（筛选/趋势/删除/清空）+ 脱敏导出（JSON/MD，先预览后确认） | |
 | 保留策略（30 天/500 次，可配置） | |
-| Rust 测试 110（单元/E2E/代理/规则/存储）+ 前端 35 全部通过 | |
+| 报告快照（F-07：状态机 Available/InFlight/Consumed，预览导出同字节，取消/写盘失败可重试，TTL+限额） | |
+| Rust 测试 134（单元 37/E2E 19/代理 13/规则 31/存储 8/导出回归 16/F-07 快照 10）+ 前端 35 全部通过 | |
 
 ## 环境要求（本机实测，2026-10-24）
 
@@ -35,6 +36,7 @@ Windows 10/11 本地优先、无需登录、**只读**的网络诊断桌面工�
 | MSVC Build Tools | VS 2022 BuildTools |
 | Windows SDK | 10.0.26100（安装于 `E:\Windows Kits\10`） |
 | WebView2 Runtime | 155.0.4283.62 |
+| OpenSSL CLI | 测试依赖（TLS mock 生成测试证书；随 Git for Windows 分发；生产应用运行时不依赖） |
 
 详细核查记录（命令与输出）：[docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)
 
@@ -76,7 +78,26 @@ npm run tauri build  # 发布构建（Phase 6 验证）
 - [docs/TEST_PLAN.md](docs/TEST_PLAN.md) — 测试策略与验收矩阵
 - [docs/DECISIONS.md](docs/DECISIONS.md) — 技术决策（ADR，D-001..D-013）与风险登记
 - [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) — 开发环境核查表
+- [docs/INSTALL.md](docs/INSTALL.md) — 安装说明（WebView2/数据位置/升级）
+- [CHANGELOG.md](CHANGELOG.md) — 更新日志
 - [ZCODE_PROMPTS.md](ZCODE_PROMPTS.md) — 分阶段开发提示词（工作流备忘）
+
+## 安装（Windows）
+
+从 [Releases](https://github.com/159357xxj/ai-dev-cockpit/releases) 下载 NSIS 安装包
+（核对 SHA-256 后安装，无需管理员权限），详见 [docs/INSTALL.md](docs/INSTALL.md)。
+卸载不会删除本地历史数据库（`%APPDATA%\com.aidevcockpit.app\history.db`）。
+
+## 隐私声明
+
+AI Dev Cockpit 是**本地优先**的只读诊断工具：
+
+- **不联网上传**：所有数据（诊断记录、历史、报告）仅保存在本机；导出经系统原生"另存为"完成，无任何网络上传。
+- **不采集凭证**：不读取/存储 Cookie、API Key、OAuth 令牌、代理订阅、SSH 私钥；诊断请求从不携带用户凭证。
+- **不遥测**：无崩溃上报、无使用统计、无账号体系。
+- **只读诊断**：不修改系统代理/DNS/路由/防火墙/注册表；不请求管理员权限；不做端口扫描或抓包。
+- **数据保留**：本地历史默认保留 30 天或 500 次（可配置）；卸载应用不自动删除该数据。
+- 完整边界见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §9 与 [AGENTS.md](AGENTS.md)。
 
 ## 隐私与安全边界（摘要）
 
@@ -86,3 +107,5 @@ npm run tauri build  # 发布构建（Phase 6 验证）
 4. 代理快照为只读本地检测，配置存在 ≠ 真实请求使用该配置；不下载/不执行 PAC。
 4. 导出报告先本地脱敏并预览确认；认证材料与敏感路径永不出现在报告中。
 5. 不做端口扫描、抓包、提权或系统设置修改。
+6. 导出使用系统原生"另存为"对话框，路径选择在本地完成，无任何网络上传。
+7. 正式（release）构建强制关闭演示模式；启动不自动联网探测，仅用户主动运行诊断时发起所选目标的 HTTPS 测量。

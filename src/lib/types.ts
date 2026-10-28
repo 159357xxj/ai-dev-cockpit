@@ -36,7 +36,9 @@ export type IpcErrorCode =
   | 'not_found'
   | 'not_available'
   | 'internal'
-  | 'cancelled';
+  | 'cancelled'
+  /** 保存目标已存在（V6-R1 / F-2）：后端"不替换"提交拒绝，需换文件名。 */
+  | 'target_exists';
 
 export interface IpcError {
   code: IpcErrorCode;
@@ -225,6 +227,8 @@ export interface ReportPreview {
   content: string;
   filename: string;
   note: string;
+  /** 服务端不可变快照 id（F-07）：导出时透传，复用同一份脱敏字节。 */
+  snapshot_id: string;
 }
 
 export interface ExportResult {

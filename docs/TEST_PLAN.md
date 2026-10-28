@@ -92,7 +92,7 @@
 1. 真实 Tauri 桌面窗口：Windows 代理配置快照读取正常（真实 WinINet/WinHTTP/环境变量数据）；
 2. GitHub 真实诊断运行正常，规则结论卡展示正常；
 3. 任务取消及界面恢复正常，无虚假成功记录、无重复结论。
-自动化基线同日全绿：cargo test 95 项、npm test 35 项、fmt/clippy/lint/typecheck/build 全部 PASS。
+自动化基线同日全绿：cargo test 95 项、npm test 35 项、fmt/clippy/lint/typecheck/build 全部 PASS。（测试数随后续迭代持续增长，最新计数见 README 与各阶段记录。）
 Phase 4 正式关闭。
 
 **R11 非 2xx 误判风险——已修复（2026-10-25 专项修复，测试先行）**：
@@ -121,7 +121,26 @@ Phase 4 正式关闭。
 - [x] 删除/清空：单删幂等、清空级联；前端二次确认。
 - [x] 导出：JSON/Markdown 本地导出（exports/ 目录，零上传）；先预览（含局限说明）后确认；
   脱敏测试集：userinfo、查询 token、本地用户路径、Authorization 全遮蔽（含修复的遮蔽死循环缺陷）。
-- [ ] 桌面重启后历史保留复验：待用户验收确认。
+- [x] 桌面重启后历史保留复验：**已通过（2026-10-25 用户验收，四项全 PASS）**——
+  完整重启后历史保留；取消任务的状态与样本正确；报告可预览/导出/正常打开；趋势与删除正常。
+  **Phase 5 正式关闭。**
+### Phase 6（发布）—— 进行中（2026-10-25）
+
+**安全审计记录（2026-10-25）**：
+
+| 审计项 | 结论 |
+|---|---|
+| Tauri capability | 仅 `core:default`（主窗口）；无 shell/fs/http 等扩展权限；dialog 未引入插件 |
+| IPC 面 | 14 个白名单命令，全部 `rename_all="snake_case"`；入参在 Rust 侧二次校验（目标白名单/次数/超时/代理 loopback/设置键白名单/16 运行上限） |
+| CSP | `default-src 'self'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'`——无远程源；style unsafe-inline 为图表内联样式所需 |
+| 网络目标白名单 | `targets.rs` 6 个预设 https 域名，生产装配仅此来源；重定向规则锁定白名单主机+https+443；`no_proxy()` 显式；手动代理仅 loopback |
+| 重试 | `.retry(never())` 显式禁用 reqwest 默认 h2/h3 NACK 重发（D-018） |
+| SQLite | 全参数化；user_version 迁移只向前；事务写入；重复保存幂等（INSERT OR REPLACE + 样本重置）；D-014 取消口径 |
+| 脱敏 | **两级防线**：① 导出契约（F-02 V3）——error.summary/detail 默认不导出，target_id 白名单 fail-closed，仅导出枚举/数字/时间戳/规则引擎固定文案；② sanitize_text 纵深防御（展示辅助）——敏感头（含折叠续行）/userinfo（多 @）/敏感键值（含 JSON 转义）/私有 IPv4（含端口）/全部 IPv6（含 scope）/用户路径（任意盘符大小写）/内部主机名（fail-closed）；全文字节索引安全（QA 三轮 panic 均已根治并有性质测试守护） |
+| Demo | 默认 false；**release 构建硬关**（DEMO_AVAILABLE=import.meta.env.DEV，设置页隐藏） |
+| 自动联网 | 无：启动仅本地读取（代理快照/SQLite），网络请求仅由用户点击触发 |
+| 凭证 | 不读取/存储/上传任何 Cookie/令牌/密钥；settings 表仅白名单键 |
+
 ### Phase 6（发布）
 - [ ] 执行并记录 AGENTS.md 验证基线全部命令；未执行的逐项写明原因。
 - [ ] 断网安装启动（PRD §8.1）；NSIS 安装/卸载/启动/历史数据位置检查。
