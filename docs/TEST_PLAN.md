@@ -1,6 +1,6 @@
 # 测试计划（AI Dev Cockpit）
 
-版本：v1.0（Phase 0）｜日期：2026-10-24｜上游：`PRD.md` §7–8、`AGENTS.md` 验证基线
+版本：v1.1（Release Gate）｜更新日期：2026-10-29｜上游：`PRD.md` §7–8、`AGENTS.md` 验证基线
 关联：`docs/ARCHITECTURE.md`（被测契约）、`docs/DECISIONS.md`
 
 ---
@@ -73,7 +73,7 @@
   - **manual_local_proxy(http://127.0.0.1:7890) → github.com**：2/3 成功（1 次 TLS 握手抖动），200 中位 330ms。
   - 结论口径：三路径中位数差异在真实抖动范围内，**不构成某路径必然更快的结论**；200 仅代表"收到响应"（D-007）；未修改任何代理客户端配置。
 
-### Phase 4（规则诊断）—— 已实现（Phase 4 交付，tests/rules_engine.rs 24 项全绿）
+### Phase 4（规则诊断）—— 已实现（Phase 4 交付，tests/rules_engine.rs 31 项全绿）
 - [x] 12 条核心规则逐一 fixture 触发 + 不触发（模式门控/前提不满足）测试。
 - [x] 置信分层：全部失败 → evidence_sufficient；部分失败 → possible；取消/样本不足 → insufficient。
 - [x] 401/403 中性解释（扫描 causes 不得含"正常登录/业务正常/账号"）；407 凭证不代填；429 不推断 IP 信誉。
@@ -124,27 +124,37 @@ Phase 4 正式关闭。
 - [x] 桌面重启后历史保留复验：**已通过（2026-10-25 用户验收，四项全 PASS）**——
   完整重启后历史保留；取消任务的状态与样本正确；报告可预览/导出/正常打开；趋势与删除正常。
   **Phase 5 正式关闭。**
-### Phase 6（发布）—— 进行中（2026-10-25）
+### Phase 6（发布）—— 完成（Gate B WAIVED）
 
-**安全审计记录（2026-10-25）**：
+- [x] 基线命令：Gate A V8 与 Gate C 有真实记录；本轮 B0 本机复跑结果见 README。
+- [ ] NSIS 安装、卸载、启动和桌面 UI：WAIVED，未执行（见 `docs/GATE_B_WAIVER.md`）。
+- [x] Tauri capability 最小权限审查：以本节审计表为依据。
+
+**安全审计记录（源码与配置审查；不等同于 Gate B 桌面验证）**：
 
 | 审计项 | 结论 |
 |---|---|
-| Tauri capability | 仅 `core:default`（主窗口）；无 shell/fs/http 等扩展权限；dialog 未引入插件 |
-| IPC 面 | 14 个白名单命令，全部 `rename_all="snake_case"`；入参在 Rust 侧二次校验（目标白名单/次数/超时/代理 loopback/设置键白名单/16 运行上限） |
-| CSP | `default-src 'self'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'`——无远程源；style unsafe-inline 为图表内联样式所需 |
-| 网络目标白名单 | `targets.rs` 6 个预设 https 域名，生产装配仅此来源；重定向规则锁定白名单主机+https+443；`no_proxy()` 显式；手动代理仅 loopback |
-| 重试 | `.retry(never())` 显式禁用 reqwest 默认 h2/h3 NACK 重发（D-018） |
-| SQLite | 全参数化；user_version 迁移只向前；事务写入；重复保存幂等（INSERT OR REPLACE + 样本重置）；D-014 取消口径 |
-| 脱敏 | **两级防线**：① 导出契约（F-02 V3）——error.summary/detail 默认不导出，target_id 白名单 fail-closed，仅导出枚举/数字/时间戳/规则引擎固定文案；② sanitize_text 纵深防御（展示辅助）——敏感头（含折叠续行）/userinfo（多 @）/敏感键值（含 JSON 转义）/私有 IPv4（含端口）/全部 IPv6（含 scope）/用户路径（任意盘符大小写）/内部主机名（fail-closed）；全文字节索引安全（QA 三轮 panic 均已根治并有性质测试守护） |
-| Demo | 默认 false；**release 构建硬关**（DEMO_AVAILABLE=import.meta.env.DEV，设置页隐藏） |
-| 自动联网 | 无：启动仅本地读取（代理快照/SQLite），网络请求仅由用户点击触发 |
-| 凭证 | 不读取/存储/上传任何 Cookie/令牌/密钥；settings 表仅白名单键 |
+| Tauri capability | 主窗口仅 `core:default`，无 shell/fs/http 等扩展权限；未引入 dialog 插件，原生保存对话框由 Rust 侧调用 |
+| IPC 面 | `lib.rs` 注册 13 个白名单命令，均使用 `rename_all="snake_case"`；Rust 侧校验目标、次数、超时、代理 loopback、设置键和诊断运行数上限 |
+| CSP | `default-src 'self'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'`；无远程脚本/连接源，`unsafe-inline` 仅用于样式 |
+| 网络目标白名单 | `targets.rs` 有 6 个 HTTPS 目标；生产请求和重定向限制到白名单主机、HTTPS 与 443；`no_proxy()` 显式；手动代理仅 loopback |
+| 重试与 TLS | `.retry(never())` 禁用 Reqwest 隐式协议 NACK 重试（D-018）；TLS 证书校验开启 |
+| SQLite | 参数化 SQL；`user_version` 向前迁移；run 与样本事务写入；重复保存幂等；WAL 固定开启；保留默认 30 天/500 次 |
+| 导出 | 白名单 DTO 不输出原始 `error.summary` / `error.detail` 和引擎自由文本；原子 no-clobber 保存拒绝覆盖；快照复用预览字节 |
+| Demo | 默认关闭；Release 构建硬关（`DEMO_AVAILABLE=import.meta.env.DEV`），设置页隐藏 |
+| 网络行为 | 启动不自动进行公网诊断；只有用户主动运行诊断时才向所选内置目标发送 HTTPS 测量请求 |
+| GitHub Actions | run 40688859414 的质量 job 成功；截至本次核查未发现 `workflow_dispatch` 运行，因此 NSIS CI 构建从未运行；CI 不启用 `test-hooks`，也不运行 `--ignored` 符号链接用例 |
 
-### Phase 6（发布）
-- [ ] 执行并记录 AGENTS.md 验证基线全部命令；未执行的逐项写明原因。
-- [ ] 断网安装启动（PRD §8.1）；NSIS 安装/卸载/启动/历史数据位置检查。
-- [ ] Tauri capability 权限最小化审查、依赖来源与锁文件审查、无明文凭证检查。
+**V5/V6 新增测试文件与契约覆盖**：
+
+| 测试文件 | 覆盖范围 |
+|---|---|
+| `v5_file_and_limits.rs` | 文件保存 fail-closed、原子性、快照容量与用户文件保护（F 组） |
+| `f07_snapshot.rs` | 报告快照状态机、TTL、限额、取消/失败重试及预览保存同字节（F-07） |
+| `v6_atomic_save.rs` | no-clobber 保存、竞争者与并发提交、临时文件清理、预览字节一致（F-1 至 F-9；符号链接 F-2 用例默认 ignored，需提权） |
+| `v6_target_projection.rs` | 导出目标白名单与安全 DTO、JSON/Markdown 投影（T-1 至 T-6） |
+| `v6_run_id.rs` | UUID v4 校验及 `invalid-run-id` 规范化（U-1 至 U-3） |
+| `v6_export_field_audit.rs` | app_version 白名单及数据库导出字段列级审计（T-2） |
 
 ## 5. 手工验收矩阵（映射 PRD §8 十条）
 
@@ -168,17 +178,18 @@ npm run lint            # P1 起
 npm run typecheck       # P1 起
 npm run test            # P1 起
 cargo fmt --check       # src-tauri，P2 起
-cargo clippy -- -D warnings   # src-tauri，P2 起
-cargo test              # src-tauri，P2 起
+cargo clippy --all-targets -- -D warnings   # src-tauri，P2 起
+cargo test --all        # src-tauri，P2 起
 tauri dev / tauri build # P1 / P6；未运行必须写明理由
 ```
 
 Phase 0 状态：以上命令因尚无工程代码，全部记为**不适用**（不是"通过"）。
 
-## 7. CI 计划（Phase 6 落地）
+## 7. CI（Phase 6 实际配置与验收）
 
-- 触发：push + PR；runner：`windows-latest`。
-- Job 1（前端）：setup-node → `npm ci` → lint → typecheck → test → build。
-- Job 2（Rust）：Rust stable-msvc → `cargo fmt --check` → `cargo clippy -- -D warnings` → `cargo test`。
-- Job 3（构建，可选/手动）：`tauri build` 产物存档。
-- 不在 CI 中访问公网预设目标；CI 失败必须修复或显式标注，不允许长期红。
+- 触发：push 到 `main`、针对 `main` 的 pull request，以及 `workflow_dispatch`；runner 为 `windows-latest`。
+- 前端 job：Node 22 → `npm ci` → `npm run lint` → `npm run typecheck` → `npm run test` → `npm run build`。
+- Rust job：Rust 1.97.1（由 `rust-toolchain.toml` 固定）→ `cargo fmt --check` → `cargo clippy --all-targets -- -D warnings` → `cargo test`。
+- run 40688859414（pull_request）质量 job 均成功：Rust 170 passed / 0 failed / 4 ignored；前端 35/35。NSIS `build-installer` job 因仅在 `workflow_dispatch` 运行而 skipped，该 CI 构建未执行。
+- 待办：评估是否将 `cargo test --all --features test-hooks --test v6_atomic_save` 的提交前竞态测试和 `cargo test --test v6_atomic_save -- --ignored` 的符号链接测试纳入适用的受控环境；当前 CI 未覆盖这两项。
+- CI 不访问公网预设目标；公网测试默认 `#[ignore]`。

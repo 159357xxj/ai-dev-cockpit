@@ -1,3 +1,4 @@
+历史文档：早期使用 ZCode 时的分阶段提示词，不再维护。
 # 直接按顺序交给 ZCode Agent 的阶段提示词
 
 使用方式：在 ZCode 新建名为 `ai-dev-cockpit` 的工作区，在根目录放置 `PRD.md` 与 `AGENTS.md`；按顺序粘贴 P0–P6。每阶段检查结果、运行测试、提交版本后再继续。首轮建议 Plan mode，常规界面改动可改用 Edit automatically。下面每个提示词都能独立复制。
