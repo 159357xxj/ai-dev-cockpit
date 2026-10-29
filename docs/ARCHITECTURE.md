@@ -1,6 +1,6 @@
 # 架构设计（AI Dev Cockpit）
 
-版本：v1.0（Phase 0）｜日期：2026-10-24｜上游文档：`PRD.md`、`AGENTS.md`
+版本：v1.1（对齐 v0.1.0 Beta 代码状态）｜更新日期：2026-10-29｜上游文档：`PRD.md`、`AGENTS.md`
 关联文档：`docs/TEST_PLAN.md`（验证策略）、`docs/DECISIONS.md`（决策记录）、`docs/ENVIRONMENT.md`（环境核查）
 
 ---
@@ -112,16 +112,19 @@ src/
 
 | 命令 | 签名 | 引入阶段 |
 |---|---|---|
-| `get_system_snapshot` | `() -> SystemSnapshot` | P1（桩）/P2（真实） |
-| `get_proxy_snapshot` | `() -> ProxySnapshot` | P3 |
-| `start_diagnostic` | `(request: DiagnosticRequest) -> JobHandle { job_id }` | P1（桩）/P2（真实） |
-| `cancel_diagnostic` | `(job_id: string) -> CancelOutcome { cancelled: bool }` | P2 |
-| `list_runs` | `(query: RunQuery) -> RunSummary[]` | P5 |
-| `get_run` | `(run_id: string) -> DiagnosticRun` | P5 |
-| `delete_run` | `(run_id: string) -> Ok` | P5 |
-| `clear_history` | `() -> Ok` | P5 |
-| `preview_sanitized_report` | `(run_id: string, format: "json"\|"markdown") -> ReportPreview`（含不透明 `snapshot_id`） | P5 |
-| `export_sanitized_report` | `(run_id: string, format: "json"\|"markdown", snapshot_id: string) -> ExportResult`（F-07：复用预览快照的同一份脱敏字节；快照单次使用、TTL 600s、≤8 份/≤8MiB、取消与写盘失败可重试） | P5 |
+| `get_system_snapshot` | `() -> Result<SystemSnapshot, IpcError>` | P1（桩）/P2（真实） |
+| `get_proxy_snapshot` | `() -> Result<ProxySnapshot, IpcError>` | P3 |
+| `start_diagnostic` | `(request: DiagnosticRequest) -> Result<JobHandle, IpcError>` | P1（桩）/P2（真实） |
+| `cancel_diagnostic` | `(job_id: string) -> Result<CancelOutcome, IpcError>` | P2 |
+| `diagnose_runs` | `(runs: DiagnosticRun[]) -> Result<Diagnosis[], IpcError>` | P4 |
+| `list_runs` | `(query: RunQuery) -> Result<RunSummary[], IpcError>` | P5 |
+| `get_run` | `(run_id: string) -> Result<DiagnosticRun, IpcError>` | P5 |
+| `delete_run` | `(run_id: string) -> Result<bool, IpcError>` | P5 |
+| `clear_history` | `() -> Result<u32, IpcError>` | P5 |
+| `get_setting` | `(key: string) -> Result<string\|null, IpcError>` | P5 |
+| `set_setting` | `(key: string, value_json: string) -> Result<(), IpcError>` | P5 |
+| `preview_sanitized_report` | `(run_id: string, format: "json"\|"markdown") -> Result<ReportPreview, IpcError>`（含不透明 `snapshot_id`） | P5 |
+| `export_sanitized_report` | `(run_id: string, format: "json"\|"markdown", snapshot_id: string) -> Result<ExportResult, IpcError>`（F-07：复用预览快照的同一份脱敏字节；快照单次使用、TTL 600s、≤8 份/≤8MiB、取消与写盘失败可重试；目标已存在时返回 `target_exists`） | P5 |
 
 ### 5.3 事件
 
@@ -280,7 +283,7 @@ struct ProxySnapshot { user_proxy: UserProxyInfo, env_vars: Vec<EnvVarInfo>, cap
 3. 环境变量（`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` 及小写，存在状态 + 脱敏值）。
 读取失败 → `status="unknown"`（不伪造"未启用"）；所有值经 `security::redaction` 脱敏出进程；PAC 仅展示 URL 不下载不执行；**配置存在 ≠ 真实请求使用**（各应用解析规则不同）。
 
-## 8. 存储设计预览（Phase 5 实现）
+## 8. 存储设计（Phase 5 实现）
 
 ```
 runs(id TEXT PK, started_at TEXT, finished_at TEXT?, status TEXT, route_mode TEXT,
@@ -288,12 +291,12 @@ runs(id TEXT PK, started_at TEXT, finished_at TEXT?, status TEXT, route_mode TEX
 results(id INTEGER PK AUTOINCREMENT, run_id TEXT FK, target_id TEXT, probe_type TEXT,
         attempt_no INTEGER, route_mode TEXT, success INTEGER, duration_ms INTEGER?,
         http_status INTEGER?, http_outcome TEXT?, error_kind TEXT?, error_summary TEXT?,
-        tested_at TEXT)
+        error_detail TEXT?, tested_at TEXT)
 settings(key TEXT PK, value_json TEXT)          -- 不储存任何凭证
 索引：idx_results_run(run_id)、idx_results_target(target_id)、idx_runs_started_at(started_at)
 ```
 - 时间全部 UTC RFC3339；UI 转本地展示。
-- 迁移带版本号、只向前；WAL 可选开启。
+- 数据库由 Rust 通过 Tauri `app_data_dir()` 下的 `history.db` 打开；迁移使用 `PRAGMA user_version` 版本化、只向前且幂等；WAL 固定开启（`journal_mode=WAL`）。
 - 写入事务保证"completed 状态的 run 必含全部已采样本"；取消/失败的 run 状态如实标注。
 - 保留策略：30 天或 500 个会话（可配置），删除/清空需用户确认。
 
@@ -302,7 +305,7 @@ settings(key TEXT PK, value_json TEXT)          -- 不储存任何凭证
 1. 只读诊断：不修改代理/DNS/路由/防火墙/注册表/hosts；不请求管理员权限；无任意命令执行入口；Tauri capability 按需最小化。
 2. 不采集：Cookie、API Key、OAuth token、代理订阅、SSH 私钥、浏览器会话。
 3. 手动代理仅 loopback 且不带凭证；输入框不允许任意命令/任意地址。
-4. 导出：先在 Rust 层脱敏（URL userinfo、query token、认证头、主机名/用户名/本地路径、代理地址）→ 预览 → 二次确认 → 本地另存；"导出"永远指本地文件，绝不上传。
+4. 导出：仅序列化 Rust 侧白名单 DTO，不含原始错误摘要/详情或引擎自由文本；预览后由原生对话框选择本地路径。保存使用同目录临时文件与 `persist_noclobber` 原子提交，不覆盖已有文件（返回 `target_exists`）；历史记录与导出文件不上传。
 5. 启动离线可用；首次启动不自动联网、不扫描；网络请求仅由用户点击触发。
 6. 代理快照展示值一律脱敏（隐藏 userinfo/token）。
 
@@ -310,13 +313,13 @@ settings(key TEXT PK, value_json TEXT)          -- 不储存任何凭证
 
 | # | 风险 | 等级 | 缓解 | 状态 |
 |---|---|---|---|---|
-| 1 | `library_default` 的代理源语义随 Reqwest 版本/特性变化，易在文档中写错 | 中 | Phase 3 用本地 mock 代理实测后把结论固化到本文档 §7.2 | 待 P3 |
+| 1 | `library_default` 的代理源语义随 Reqwest 版本/特性变化，易在文档中写错 | 中 | Phase 3 对锁定依赖和 Windows 环境用本地 mock 实测，结论固化于 §7.2 / D-019 | 已处理；依赖升级后需复验 |
 | 2 | Windows SDK 缺失导致链接失败 | 高→**已排除** | 链接测试通过；SDK 位于 `E:\Windows Kits\10`（26100） | 已关闭 |
 | 3 | TUN/透明代理不可可靠检测，UI 若断言会误导 | 高 | 只出免责声明，绝不声称"检测到/未开启 TUN" | 设计已规避 |
 | 4 | SOCKS5 与 SOCKS5h 域名解析位置不同，结果不可比却易被误读 | 中 | 模式说明固定展示差异；对比页仅比较同模式样本 | 设计已规避 |
 | 5 | 公网目标结果天然不稳定，自动化测试会假失败 | 中 | 自动化测试全部使用本地 mock 服务器；公网探测仅人工检查项 | 设计已规避 |
-| 6 | WebView2 注册表标准检测键缺失（本机已证实） | 低 | 文件系统证据已记录；P6 打包时复核 NSIS bootstrap 判据 | 已记录 |
-| 7 | Node 24 / Rust 1.97 较新的依赖兼容性 | 低 | 锁文件固定版本；CI 覆盖（P6） | 持续观察 |
+| 6 | WebView2 注册表标准检测键缺失（本机已证实） | 低 | 文件系统证据已记录；CI NSIS 打包和安装版 WebView2 行为未运行（Gate B WAIVED） | 未验证 |
+| 7 | Node 24 / Rust 1.97 较新的依赖兼容性 | 低 | 锁文件固定依赖；Rust 工具链由 `rust-toolchain.toml` 固定为 1.97.1，CI 使用 Node 22 | 持续观察 |
 
 ## 11. Phase 1 最小文件清单与验收命令
 

@@ -17,7 +17,7 @@
 | 3 | Git 提交身份 | 必需 | 原为空；已按用户确认配置仓库级 `user.name=159357xxj`、`user.email=159357xxj@users.noreply.github.com`（仅写入本仓库 .git/config，未改全局） | `git config --get user.name` / `git config --get user.email` | 已验证 |
 | 4 | Node.js | LTS | v24.19.0（x64） | `node --version`；`node -p "process.arch"` | 已验证 |
 | 5 | npm | 随 Node | 11.17.0 | `npm --version` | 已验证 |
-| 6 | Rust 工具链 | stable-msvc | rustc 1.97.1 / cargo 1.97.1，active: `stable-x86_64-pc-windows-msvc` | `rustc --version`；`cargo --version`；`rustup show` | 已验证 |
+| 6 | Rust 工具链 | stable-msvc | rustc 1.97.1 / cargo 1.97.1，active: `stable-x86_64-pc-windows-msvc`；自 V6-R7 起由仓库根目录 `rust-toolchain.toml` 固定为 1.97.1（本地与 CI 一致） | `rustc --version`；`cargo --version`；`rustup show` | 已验证 |
 | 7 | MSVC C++ Build Tools | 必需 | VS 2022 BuildTools，含 x86/x64 VC 工具集 | `vswhere.exe -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath` → `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools` | 已验证 |
 | 8 | Windows SDK | Rust 链接必需 | 安装于 `E:\Windows Kits\10\`（注册表 `HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots → KitsRoot10`），含 10.0.22000 / 10.0.22621 / 10.0.26100 三版 Include/Lib。**注意：不在 C 盘默认路径，初查 C 盘目录时易误判为缺失** | `reg query 'HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots' /v KitsRoot10`；`ls E:/Windows Kits/10/{Include,Lib}` | 已验证 |
 | 9 | Rust 真实构建/链接 | 必需 | 临时目录内 `cargo new` + `cargo build`（无依赖 hello-world）成功，生成 `linktest.exe`，退出码 0，耗时 28.6s；测试后已清理 | `cargo new linktest --bin --vcs none`；`cargo build`（位于 `%TEMP%\msvc-link-test`） | 已验证 |
@@ -44,3 +44,8 @@
 
 - `rustup component add rustfmt clippy`：工具链缺 rustfmt/clippy 组件（AGENTS.md 验证基线必需）。此操作为**用户级** rustup 组件安装（写入 `C:\Users\ASUS\.rustup`），无需管理员权限，不属于全局软件安装。安装后 `cargo fmt --check` 与 `cargo clippy -- -D warnings` 均可执行。
 - `tauri dev` 实测可启动桌面窗口（WebView2 渲染正常），无新增系统前置条件。
+
+
+## 6. V6-R7 工具链变更记录
+
+- 仓库根目录文件 rust-toolchain.toml 将本地工具链固定为 Rust 1.97.1；GitHub Actions 的 Rust 安装与版本校验同步使用 1.97.1。Gate C 的实际 CI 结果见 docs/RELEASE_ACCEPTANCE_REPORT_GATE_C.md。

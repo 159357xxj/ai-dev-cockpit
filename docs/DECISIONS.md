@@ -154,5 +154,25 @@
 - **验收记录（2026-10-25）**：Phase 5 正式通过功能验收——真机四项验证 PASS（重启历史保留 /
   取消状态与样本正确 / 报告预览导出可正常打开 / 趋势与删除正常）。Phase 5 关闭，进入 Phase 6。
 
+## D-023 报告保存采用原子不覆盖提交（V6，契约 F 组）
+- 背景：普通文件重命名在目标路径并发创建时可能替换用户已有文件；`exists()` 检查不能提供原子不覆盖保证。
+- 决定：报告先写入同目录独占临时文件，再以 `persist_noclobber` 原子提交；目标已存在时一律拒绝，并提示用户换名。
+- 后果：保存失败不会删除或覆盖用户目标文件；提交与并发保护见 `docs/RELEASE_ACCEPTANCE_REPORT_V8.md` 的 F 组结论。
+
+## D-024 报告导出只使用白名单 DTO（V6，契约 T / U 组）
+- 背景：诊断和历史记录包含不可信自由文本，通用文本替换不足以保证 JSON 与 Markdown 导出安全。
+- 决定：导出先投影为受限 DTO；目标标签用 `SafeTargetLabel` 白名单，诊断文案由静态规则表生成，`app_version` 使用精确白名单；未知目标和非法 `run_id` 分别规范化为 `unknown-target` 与 `invalid-run-id`。
+- 后果：原始 `error.summary`、`error.detail` 和诊断引擎自由文本不进入默认导出；复验依据见 `docs/RELEASE_REMEDIATION_REPORT_V6.md` 与 `docs/RELEASE_ACCEPTANCE_REPORT_V8.md`。
+
+## D-025 本地与 CI 固定 Rust 1.97.1（V6-R7）
+- 背景：CI 使用浮动 stable 时升至 1.99.1 后，新 Clippy 规则导致质量检查失败，本地与 CI 工具链也可能漂移。
+- 决定：在仓库根目录 `rust-toolchain.toml` 固定 Rust 1.97.1；CI 安装步骤及版本校验同步固定为 1.97.1。
+- 后果：本地与 CI 使用相同 Rust 工具链；实际 CI 版本与检查结果见 `docs/RELEASE_ACCEPTANCE_REPORT_GATE_C.md`。
+
+## D-026 v0.1.0 豁免 Gate B 并通过公开发行仓库分发
+- 背景：v0.1.0 Beta 发布时，真实 Windows 安装、升级、卸载和桌面 UI 验收未执行。
+- 决定：负责人豁免本版 Gate B；源码仓库保持私有，安装包和校验文件通过公开的 `ai-dev-cockpit-releases` 仓库分发。
+- 后果：Gate B 状态是 `WAIVED`，不代表通过；未验证范围见 `docs/GATE_B_WAIVER.md`。
+
 ## 变更流程
 新决策追加新编号条目（如 D-011）；推翻旧决策时新条目标注"替代 D-xxx"，旧条目状态改为"已替代（见 D-xxx）"。
