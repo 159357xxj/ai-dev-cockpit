@@ -14,24 +14,24 @@ Windows 10/11 本地优先、无需登录、**只读**的网络诊断桌面工�
 - Gate C：PASS，仅指 CI 质量检查（run [40688859414](https://github.com/159357xxj/ai-dev-cockpit/actions/runs/40688859414)，提交 `ede0f59`；见 [docs/RELEASE_ACCEPTANCE_REPORT_GATE_C.md](docs/RELEASE_ACCEPTANCE_REPORT_GATE_C.md)）。
 - Gate B：WAIVED；安装、升级、卸载和桌面界面验收未执行（见 [docs/GATE_B_WAIVER.md](docs/GATE_B_WAIVER.md)）。
 
-| 已实现 | 未实现（按阶段推进） |
-|---|---|
-| Tauri 2 + React 19 + TS strict + Vite 工程与锁文件 | 发布签署（安装包未签名，SmartScreen 提示见 INSTALL） |
-| 五页界面 + 深浅主题 + 演示模式（仅开发构建可开启） | Gate B 安装、升级、卸载和桌面界面验收（WAIVED，未执行） |
-| 真实探测：DNS（系统解析器）/ TCP 443 / HTTPS（Reqwest + 证书校验） | 外部漏洞数据库审计（npm audit / cargo audit） |
-| 调度器：3/5 次采样、并发 ≤3、单请求 1–10s、任务截止 120s、取消 | |
-| 事件流：progress/completed/failed，终态恰好一个，订阅先于启动 | |
-| 错误分类：dns/tcp/tls 失败、超时、取消、代理不可用、401/403/407/429/5xx 中性细分 | |
-| Windows 代理快照（WinINet/WinHTTP/环境变量，只读、脱敏、来源分别标注） | |
-| 三种 HTTPS 路由模式（no_app_proxy / library_default / manual_local_proxy，IPC 三模式全通） | |
-| 路径对比页接入真实测量（多模式顺序执行、样本互不共享） | |
-| 规则诊断引擎：12 条规则（R01–R12）、确定性输出、证据分层（事实/解释/局限）；R11 非 2xx 误判已修复关闭 | |
-| 诊断结论卡：严重程度排序、置信徽标、可展开细节（两页接入） | |
-| SQLite 历史（筛选/趋势/删除/清空）+ 脱敏导出（JSON/MD，先预览后确认） | |
-| 保留策略（30 天/500 次，可配置） | |
-| 报告快照（F-07：状态机 Available/InFlight/Consumed，预览导出同字节，取消/写盘失败可重试，TTL+限额） | |
-| 导出保存原子不覆盖：目标已存在时拒绝保存并提示换名；导出仅使用白名单 DTO | 代码签名、npm audit / cargo audit、CI 中的 NSIS 打包作业（从未运行） |
-| 本机 Rust：170 passed / 0 failed / 4 ignored；test-hooks 原子保存套件：9 passed / 0 failed / 1 ignored | SSH 面板、自定义目标（PRD P2，尚未实现） |
+| 已实现 |
+| --- |
+| Tauri 2 + React 19 + TS strict + Vite 工程与锁文件 |
+| 五页界面 + 深浅主题 + 演示模式（仅开发构建可开启） |
+| 真实探测：DNS（系统解析器）/ TCP 443 / HTTPS（Reqwest + 证书校验） |
+| 调度器：3/5 次采样、并发 ≤3、单请求 1–10s、任务截止 120s、取消 |
+| 事件流：progress/completed/failed，终态恰好一个，订阅先于启动 |
+| 错误分类：dns/tcp/tls 失败、超时、取消、代理不可用、401/403/407/429/5xx 中性细分 |
+| Windows 代理快照（WinINet/WinHTTP/环境变量，只读、脱敏、来源分别标注） |
+| 三种 HTTPS 路由模式（no_app_proxy / library_default / manual_local_proxy，IPC 三模式全通） |
+| 路径对比页接入真实测量（多模式顺序执行、样本互不共享） |
+| 规则诊断引擎：12 条规则（R01–R12）、确定性输出、证据分层（事实/解释/局限）；R11 非 2xx 误判已修复关闭 |
+| 诊断结论卡：严重程度排序、置信徽标、可展开细节（两页接入） |
+| SQLite 历史（筛选/趋势/删除/清空）+ 脱敏导出（JSON/MD，先预览后确认） |
+| 保留策略（30 天/500 次，可配置） |
+| 报告快照（F-07：状态机 Available/InFlight/Consumed，预览导出同字节，取消/写盘失败可重试，TTL+限额） |
+| 导出保存原子不覆盖：目标已存在时拒绝保存并提示换名；导出仅使用白名单 DTO |
+| 本机 Rust：170 passed / 0 failed / 4 ignored；test-hooks 原子保存套件：9 passed / 0 failed / 1 ignored |
 
 ## 环境要求（本机核查，2026-10-29）
 
